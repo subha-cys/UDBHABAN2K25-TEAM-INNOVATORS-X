@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Admin Dashboard | attmanege</title>
+    <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@700;900&family=Inter:wght@400;600&display=swap" rel="stylesheet">
+    <style>
+        :root{--bg-1:#071225;--bg-2:#061028;--neon-a:#00ffd5;--neon-b:#6b8cff;--neon-c:#ff4d94}
+        html,body{height:100%;margin:0;font-family:Inter,Montserrat,system-ui;background:linear-gradient(180deg,var(--bg-1),var(--bg-2));color:#e8fbff}
+        body::after{content:'';position:fixed;inset:0;background-image:radial-gradient(rgba(255,255,255,0.02) 1px, transparent 1px);background-size:100px 100px;opacity:0.5;mix-blend-mode:overlay;pointer-events:none}
+        .container{width:clamp(760px,92%,1200px);margin:36px auto;border-radius:18px;padding:26px;background:linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01));box-shadow:0 40px 100px rgba(0,0,0,0.7);position:relative;overflow:visible}
+        .container::after{content:'';position:absolute;right:-60px;top:-40px;width:420px;height:420px;background-image:url('/static/logo.png');background-size:contain;background-repeat:no-repeat;opacity:0.06;transform:rotate(-12deg)}
+        h1{font-size:1.9rem;margin:0;color:var(--neon-b);font-weight:900;text-shadow:0 6px 28px rgba(107,140,255,0.06)}
+        h2{margin:6px 0 18px;color:#cfeeff}
+    .btn{position:relative;display:inline-flex;align-items:center;gap:10px;padding:10px 14px;border-radius:12px;border:0;font-weight:800;cursor:pointer;background:linear-gradient(90deg,var(--neon-b),var(--neon-a));color:#022;overflow:hidden;transition:transform .18s ease,box-shadow .18s}
+    .btn::after{content:'';position:absolute;left:-60%;top:0;width:60%;height:100%;background:linear-gradient(120deg, rgba(255,255,255,0.12), rgba(255,255,255,0.02), transparent);transform:skewX(-18deg);transition:left .6s ease}
+    .btn:hover{transform:translateY(-6px);box-shadow:0 22px 88px rgba(2,6,23,0.7),0 0 48px rgba(107,140,255,0.12)}
+    .btn:hover::after{left:120%}
+    .btn .ripple{position:absolute;border-radius:50%;transform:scale(0);pointer-events:none;opacity:0.9;background:rgba(255,255,255,0.14);animation:ripple 650ms cubic-bezier(.2,.7,.2,1)}
+    @keyframes ripple{to{transform:scale(8);opacity:0}}
+        .logout{float:right}
+        .cols{display:flex;gap:20px;flex-wrap:wrap}
+        .col{flex:1;min-width:280px}
+    .panel{background:linear-gradient(180deg, rgba(255,255,255,0.01), rgba(255,255,255,0.005));padding:12px;border-radius:12px;box-shadow:0 10px 40px rgba(0,0,0,0.6);border:1px solid rgba(255,255,255,0.02)}
+    /* ensure text is readable inside white boxes */
+    .white-box{color:#0b2b3a}
+    .video-stack{position:relative;width:100%;height:520px;max-height:820px;overflow:hidden}
+    .video-stack img{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;border-radius:6px;transition:opacity .18s ease;display:block}
+        .right-tilt{transform-style:preserve-3d;transition:transform .12s ease}
+        #video-preview{background:#000;border-radius:8px;border:1px solid rgba(255,255,255,0.02);}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Admin Dashboard</h1>
+        <h2>Welcome, {{ user }} | <a href="/logout" class="btn logout">Logout</a></h2>
+        <div style="text-align:center;">
+            <a href="/" class="btn">Home</a>
+            <a href="/attendance" class="btn">View Attendance (Admin)</a>
+            <a href="/download" class="btn">Download Excel</a>
+        </div>
+        <div id="admin-content" style="margin-top:32px;">
+            <div style="display:flex;gap:20px;flex-wrap:wrap;">
+                <div style="flex:1; min-width:280px;">
+                    <h3>Pending Student Approvals</h3>
+                    <div id="pending-list" style="margin-bottom:16px; display:flex;flex-direction:column;gap:8px;">
+                        <!-- populated by JS -->
+                    </div>
+
+                    <h3 style="margin-top:24px;">Manage Admins</h3>
+                    <form id="add-admin-form" method="post" action="/admin/add_admin" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                        <input name="username" placeholder="username" required>
+                        <input name="password" placeholder="password" required type="password">
+                        <button class="btn" type="submit">Add Admin</button>
+                        <button id="reload-admins-btn" type="button" class="btn" style="background:linear-gradient(90deg,#ffb347,#ffcc33);">Reload Admins</button>
+                    </form>
+                    <div style="margin-top:8px;" id="admins-list">
+                        <!-- current admins inserted by server-side for initial render -->
+                        {% for a, h in USERS.items() %}
+                            <div style="background:#f7fafd;padding:8px;border-radius:8px;margin:6px 0;display:flex;justify-content:space-between;align-items:center;color:#0b2b3a;">
+                                <span style="color:#0b2b3a">{{ a }}</span>
+                                {% if a != user %}
+                                    <form method="post" action="/admin/delete_admin/{{ a }}">
+                                        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                                        <button class="btn" type="submit">Delete</button>
+                                    </form>
+                                {% endif %}
+                            </div>
+                        {% endfor %}
+                    </div>
+                </div>
