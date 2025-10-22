@@ -102,3 +102,404 @@ def register():
 COLLEGE_NAME = "Raajdhani Engineering College"
 SITE_TITLE = "attmanege"
 EXCEL_PATH = os.path.join(os.path.dirname(__file__), '..', 'data', 'attendance.xlsx')
+
+STUDENTS_JSON = os.path.join(os.path.dirname(__file__), '..', 'data', 'students.json')
+ADMINS_JSON = os.path.join(os.path.dirname(__file__), '..', 'data', 'admins.json')
+PASSWORD_RESETS_JSON = os.path.join(os.path.dirname(__file__), '..', 'data', 'password_resets.json')
+
+def load_students():
+    import json
+    if os.path.exists(STUDENTS_JSON):
+        with open(STUDENTS_JSON, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return {}
+
+def save_students(d):
+    import json
+    os.makedirs(os.path.dirname(STUDENTS_JSON), exist_ok=True)
+    with open(STUDENTS_JSON, 'w', encoding='utf-8') as f:
+        json.dump(d, f, indent=2)
+
+
+def load_admins():
+    import json
+    if os.path.exists(ADMINS_JSON):
+        with open(ADMINS_JSON, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return {}
+
+
+def save_admins(d):
+    import json
+    os.makedirs(os.path.dirname(ADMINS_JSON), exist_ok=True)
+    with open(ADMINS_JSON, 'w', encoding='utf-8') as f:
+        json.dump(d, f, indent=2)
+
+
+def load_password_resets():
+    import json
+    if os.path.exists(PASSWORD_RESETS_JSON):
+        with open(PASSWORD_RESETS_JSON, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return {}
+
+
+def save_password_resets(d):
+    import json
+    os.makedirs(os.path.dirname(PASSWORD_RESETS_JSON), exist_ok=True)
+    with open(PASSWORD_RESETS_JSON, 'w', encoding='utf-8') as f:
+        json.dump(d, f, indent=2)
+
+
+
+# Simple user store (demo) - will be populated from data/admins.json
+USERS = {}
+
+# Initialize admins from disk (create default admin if missing)
+try:
+    _admins = load_admins()
+except Exception:
+    _admins = {}
+if not _admins:
+    # create default admin with password 'admin' (hashed)
+    _admins = {'admin': generate_password_hash('admin')}
+    save_admins(_admins)
+else:
+    # ensure at least a default 'admin' user exists for convenience
+    if 'admin' not in _admins:
+        _admins['admin'] = generate_password_hash('admin')
+        save_admins(_admins)
+USERS.update(_admins)
+
+
+@app.context_processor
+def inject_users():
+    # make USERS available in templates for admin UI
+    # ensure CSRF token exists for the session
+    if 'csrf_token' not in session:
+        session['csrf_token'] = secrets.token_urlsafe(16)
+    return dict(USERS=USERS, csrf_token=session.get('csrf_token'))
+
+
+def require_csrf():
+    # simple CSRF check for POST requests
+    if request.method == 'POST':
+        token = request.form.get('csrf_token') or request.headers.get('X-CSRF-Token')
+        if not token or token != session.get('csrf_token'):
+            return False
+    return True
+
+@app.route('/')
+def home():
+    user = session.get('user')
+    return render_template('index.html', college=COLLEGE_NAME, site=SITE_TITLE, user=user)
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    error = None
+    if request.method == 'POST':
+        username = request.form.get('username', '').strip()
+        password = request.form.get('password', '')
+        is_ajax = request.headers.get('X-Requested-With') == 'XMLHttpRequest' or request.is_json or 'application/json' in request.headers.get('Accept', '')
+        if username in USERS and check_password_hash(USERS[username], password):
+            session['user'] = username
+            if is_ajax:
+                return jsonify({'ok': True, 'redirect': url_for('admin')})
+            return redirect(url_for('admin'))
+        else:
+            if is_ajax:
+                return jsonify({'ok': False, 'error': 'Invalid username or password'}), 401
+            error = 'Invalid username or password'
+    return render_template('login.html', error=error)
+
+@app.route('/logout')
+def logout():
+    session.pop('user', None)
+    session.pop('student', None)
+    return redirect(url_for('home'))
+
+
+@app.route('/student_login', methods=['GET', 'POST'])
+def student_login():
+    error = None
+    if request.method == 'POST':
+        enroll = request.form.get('enroll','').strip()
+        password = request.form.get('password','')
+        students = load_students()
+        user = students.get(enroll)
+        is_ajax = request.headers.get('X-Requested-With') == 'XMLHttpRequest' or request.is_json or 'application/json' in request.headers.get('Accept', '')
+        if user and user.get('approved') and check_password_hash(user.get('password',''), password):
+            session['student'] = enroll
+            if is_ajax:
+                return jsonify({'ok': True, 'redirect': url_for('student_dashboard')})
+            return redirect(url_for('student_dashboard'))
+        elif user and not user.get('approved'):
+            if is_ajax:
+                return jsonify({'ok': False, 'error': 'Account pending approval by admin.'}), 403
+            error = 'Account pending approval by admin.'
+        else:
+            if is_ajax:
+                return jsonify({'ok': False, 'error': 'Invalid credentials.'}), 401
+            error = 'Invalid credentials.'
+    return render_template('student_login.html', error=error)
+
+
+def compute_student_attendance_and_score(enroll):
+    # Very small logic: read Summary sheet, find row for enroll, compute percentage and score
+    wb = openpyxl.load_workbook(EXCEL_PATH, data_only=True)
+    sheet = wb['Summary']
+    headers = [cell.value for cell in next(sheet.iter_rows(min_row=1, max_row=1))]
+    rows = list(sheet.iter_rows(min_row=2, values_only=True))
+
+    # detect key columns
+    enroll_col = None
+    name_col = None
+    total_col = None
+    present_col = None
+    for i, h in enumerate(headers):
+        if not h:
+            continue
+        lh = str(h).strip().lower()
+        if 'enroll' in lh or lh == 'id':
+            enroll_col = i
+        if 'name' in lh:
+            name_col = i
+        if 'total' in lh:
+            total_col = i
+        if 'present' in lh or 'attend' in lh:
+            present_col = i
+
+    # identify attendance/session columns: headers that look like dates or remaining numeric flags
+    session_cols = []
+    import re
+    date_re = re.compile(r"\d{4}-\d{1,2}-\d{1,2}|\d{1,2}/\d{1,2}/\d{2,4}")
+    for i, h in enumerate(headers):
+        if i in (enroll_col, name_col, total_col, present_col):
+            continue
+        if h and date_re.search(str(h)):
+            session_cols.append(i)
+    # fallback: take trailing columns after metadata
+    if not session_cols:
+        # assume first 3 columns are meta (name,enroll,maybe total), so take rest
+        if len(headers) > 4:
+            session_cols = list(range(4, len(headers)))
+
+    def is_present_value(v):
+        if v is None:
+            return False
+        if isinstance(v, (int, float)):
+            return int(v) != 0
+        s = str(v).strip().lower()
+        return s in ('1', 'p', 'present', 'y', 'yes', 'true')
+
+    for r in rows:
+        try:
+            if enroll_col is not None and str(r[enroll_col]) == str(enroll):
+                # try per-session columns
+                present_count = 0
+                total_sessions = 0
+                for c in session_cols:
+                    total_sessions += 1
+                    if is_present_value(r[c]):
+                        present_count += 1
+                percentage = None
+                if total_sessions > 0:
+                    percentage = round((present_count / total_sessions) * 100, 2)
+                # fallback to present/total columns if present
+                if percentage is None and total_col is not None and present_col is not None:
+                    try:
+                        percentage = round((r[present_col] / r[total_col]) * 100, 2)
+                    except Exception:
+                        percentage = None
+                score = round((percentage or 0) / 10, 2) if percentage is not None else None
+                # compute streak: consecutive presents from most recent session_cols
+                streak = 0
+                for c in reversed(session_cols):
+                    if is_present_value(r[c]):
+                        streak += 1
+                    else:
+                        break
+                return {'percentage': percentage, 'score': score, 'streak': streak, 'raw': {'present_count': present_count, 'sessions': total_sessions}}
+        except Exception:
+            continue
+    return {'percentage': None, 'score': None, 'streak': 0, 'raw': {}}
+
+
+@app.route('/student_dashboard')
+def student_dashboard():
+    enroll = session.get('student')
+    if not enroll:
+        return redirect(url_for('student_login'))
+    students = load_students()
+    student = students.get(enroll)
+    stats = compute_student_attendance_and_score(enroll)
+    leaderboard, streaks = compute_leaderboard_and_streaks(1000)
+    rank = None
+    for i, item in enumerate(leaderboard):
+        if str(item.get('enroll')) == str(enroll):
+            rank = i + 1
+            break
+    my_streak = streaks.get(enroll, 0)
+    return render_template('student_dashboard.html', student=student, stats=stats, rank=rank, streak=my_streak)
+
+
+def compute_leaderboard_and_streaks(top_n=10):
+    # Reads Summary sheet and returns sorted leaderboard by percentage and streaks
+    wb = openpyxl.load_workbook(EXCEL_PATH)
+    sheet = wb['Summary']
+    headers = [cell.value for cell in next(sheet.iter_rows(min_row=1, max_row=1))]
+    rows = list(sheet.iter_rows(min_row=2, values_only=True))
+    enroll_col = None
+    present_col = None
+    total_col = None
+    name_col = None
+    # try detect columns
+    for i, h in enumerate(headers):
+        if h and 'enroll' in str(h).lower():
+            enroll_col = i
+        if h and 'name' in str(h).lower():
+            name_col = i
+        if h and ('present' in str(h).lower() or 'attended' in str(h).lower()):
+            present_col = i
+        if h and 'total' in str(h).lower():
+            total_col = i
+
+    leaderboard = []
+    streaks = {}
+    # For streaks, assume there are daily/monthly columns after the initial metadata; we'll try heuristically
+    # prepare session columns detection similar to above
+    import re
+    date_re = re.compile(r"\d{4}-\d{1,2}-\d{1,2}|\d{1,2}/\d{1,2}/\d{2,4}")
+    session_cols = []
+    for i, h in enumerate(headers):
+        if h and date_re.search(str(h)):
+            session_cols.append(i)
+    if not session_cols and len(headers) > 4:
+        session_cols = list(range(4, len(headers)))
+
+    def is_present_value(v):
+        if v is None:
+            return False
+        if isinstance(v, (int, float)):
+            return int(v) != 0
+        s = str(v).strip().lower()
+        return s in ('1', 'p', 'present', 'y', 'yes', 'true')
+
+    for r in rows:
+        try:
+            enroll = str(r[enroll_col]) if enroll_col is not None else None
+            name = r[name_col] if name_col is not None else enroll
+            total = r[total_col] if total_col is not None else None
+            present = r[present_col] if present_col is not None else None
+            percentage = None
+            # compute percentage from session columns when available
+            present_count = None
+            total_sessions = None
+            if session_cols:
+                total_sessions = 0
+                present_count = 0
+                for c in session_cols:
+                    total_sessions += 1
+                    if is_present_value(r[c]):
+                        present_count += 1
+                try:
+                    percentage = round((present_count / total_sessions) * 100, 2)
+                except Exception:
+                    percentage = None
+            elif total is not None and present is not None:
+                try:
+                    percentage = round((present / total) * 100, 2)
+                except Exception:
+                    percentage = None
+            # compute streak from session_cols
+            streak_val = 0
+            if session_cols:
+                for c in reversed(session_cols):
+                    if is_present_value(r[c]):
+                        streak_val += 1
+                    else:
+                        break
+            else:
+                streak_val = int((percentage // 10)) if percentage is not None else 0
+            leaderboard.append({'enroll': enroll, 'name': name, 'percentage': percentage or 0})
+            streaks[enroll] = streak_val
+        except Exception:
+            continue
+    leaderboard.sort(key=lambda x: x['percentage'], reverse=True)
+    return leaderboard[:top_n], streaks
+
+
+@app.route('/admin/approve/<enroll>', methods=['POST'])
+def admin_approve(enroll):
+    user = session.get('user')
+    if not user:
+        return jsonify({'error': 'not-authorized'}), 401
+    if not require_csrf():
+        return jsonify({'error': 'csrf-failed'}), 400
+    students = load_students()
+    s = students.get(enroll)
+    if not s:
+        return jsonify({'error': 'not-found'}), 404
+    s['approved'] = True
+    save_students(students)
+    return redirect(url_for('admin'))
+
+
+@app.route('/admin/add_admin', methods=['POST'])
+def admin_add_admin():
+    user = session.get('user')
+    if not user:
+        return jsonify({'error': 'not-authorized'}), 401
+    if not require_csrf():
+        return jsonify({'error': 'csrf-failed'}), 400
+    username = request.form.get('username')
+    password = request.form.get('password')
+    if not username or not password:
+        return redirect(url_for('admin'))
+    admins = load_admins()
+    if username in admins:
+        # don't overwrite existing admin
+        return redirect(url_for('admin'))
+    admins[username] = generate_password_hash(password)
+    save_admins(admins)
+    # also add to USERS in-memory for current run
+    USERS[username] = admins[username]
+    return redirect(url_for('admin'))
+
+
+@app.route('/admin/reload_admins', methods=['POST'])
+def admin_reload_admins():
+    user = session.get('user')
+    if not user:
+        return jsonify({'error': 'not-authorized'}), 401
+    if not require_csrf():
+        return jsonify({'error': 'csrf-failed'}), 400
+    try:
+        new_admins = load_admins()
+        if new_admins:
+            USERS.clear()
+            USERS.update(new_admins)
+            return jsonify({'status': 'reloaded', 'count': len(new_admins)})
+        return jsonify({'status': 'no-admins-found'}), 400
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/admin/change_password', methods=['POST'])
+def admin_change_password():
+    user = session.get('user')
+    if not user:
+        return jsonify({'error': 'not-authorized'}), 401
+    if not require_csrf():
+        return jsonify({'error': 'csrf-failed'}), 400
+    target = request.form.get('username')
+    newpw = request.form.get('password')
+    if not target or not newpw:
+        return jsonify({'error': 'missing'}), 400
+    admins = load_admins()
+    if target not in admins:
+        return jsonify({'error': 'not-found'}), 404
+    admins[target] = generate_password_hash(newpw)
+    save_admins(admins)
+USERS[target] = admins[target]
+    return jsonify({'status': 'changed'})
