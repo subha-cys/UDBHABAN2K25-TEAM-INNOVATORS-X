@@ -1,0 +1,8 @@
+opencv-python
+face_recognition
+insightface
+onnxruntime
+numpy
+pillow
+openpyxl
+filelock
