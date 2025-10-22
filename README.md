@@ -45,3 +45,18 @@ Next steps (optional enhancements):
 - Record first/last seen timestamps in the Summary sheet.
 - Add auto-reconnect/backoff improvements and watchdogs for unstable streams.
 - Provide a small web UI for attendance viewing.
+a simple form is :- Web App]
+     │
+     ├── Load encodings (pickle)
+     │
+     ├── Start Recognizer → [subprocess → live_recognize.py]
+     │                             │
+     │                             ├── Capture video (OpenCV)
+     │                             ├── Detect & recognize (face_recognition + numpy)
+     │                             ├── Lock file (filelock)
+     │                             ├── Write attendance (openpyxl)
+     │                             └── Update encodings (pickle)
+     │
+     ├── Show attendance (openpyxl)
+     ├── Generate reports (python-docx)
+     └── Stop recognizer (subprocess kill)
