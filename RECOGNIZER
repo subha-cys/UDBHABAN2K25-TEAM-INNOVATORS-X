@@ -69,7 +69,7 @@ def update_attendance_xlsx(names, timestamp, img_path):
         summ = wb['Summary']
         if summ.max_row == 0:
             summ.append(['Name', 'Date', 'Time'])
-    
+        # append a row per name
         try:
             dt = datetime.strptime(timestamp, '%Y%m%d_%H%M%S')
             date_str = dt.strftime('%Y-%m-%d')
@@ -94,9 +94,177 @@ def save_attendance(frame, names):
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     img_path = ATTENDANCE_DIR / f'attendance_{timestamp}.jpg'
     cv2.imwrite(str(img_path), frame)
- 
+    # append csv log
     try:
         with open(ATTENDANCE_LOG, 'a', encoding='utf-8') as f:
             f.write(f"{timestamp},\"{', '.join(names)}\",{img_path}\n")
     except Exception:
         pass
+    # write to sqlite DB
+    try:
+        ATTENDANCE_DIR.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(ATTENDANCE_DB))
+        cur = conn.cursor()
+        cur.execute('''CREATE TABLE IF NOT EXISTS attendance (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT,
+            when_ts TEXT,
+            image_path TEXT
+        )''')
+        for n in names:
+            cur.execute('INSERT INTO attendance (name, when_ts, image_path) VALUES (?, ?, ?)', (n, timestamp, str(img_path)))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+
+class Recognizer:
+    def __init__(self, source=0, tolerance=0.45, detection_interval=3):
+        self.source = source
+        self.tolerance = tolerance
+        self.detection_interval = detection_interval
+        self._stop_event = threading.Event()
+        self._thread = None
+        self._lock = threading.Lock()
+        self.latest_frame = None  # jpeg bytes
+        self.latest_names = []
+        # in-memory db
+        self._db_names = []
+        self._db_encs = []
+        self._db_mtime = None
+
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop_event.set()
+        if self._thread:
+            self._thread.join(timeout=2)
+
+    def running(self):
+        return self._thread is not None and self._thread.is_alive() and not self._stop_event.is_set()
+
+    def _run(self):
+        # initial DB load
+        names, encs = load_db(DB_PATH)
+        self._db_names = names
+        self._db_encs = [np.array(e) for e in encs] if encs else []
+        try:
+            self._db_mtime = DB_PATH.stat().st_mtime
+        except Exception:
+            self._db_mtime = None
+        cap = cv2.VideoCapture(self.source)
+        frame_idx = 0
+        while not self._stop_event.is_set():
+            # check DB file for updates and reload if changed
+            try:
+                if DB_PATH.exists():
+                    m = DB_PATH.stat().st_mtime
+                    if self._db_mtime is None or m != self._db_mtime:
+                        # reload
+                        names, encs = load_db(DB_PATH)
+                        with self._lock:
+                            self._db_names = names
+                            self._db_encs = [np.array(e) for e in encs] if encs else []
+                            self._db_mtime = m
+            except Exception:
+                pass
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                time.sleep(0.5)
+                continue
+            frame_idx += 1
+            # downscale for faster detection
+            small = cv2.resize(frame, (0, 0), fx=0.5, fy=0.5)
+            rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+            if frame_idx % self.detection_interval == 0:
+                try:
+                    locs = face_recognition.face_locations(rgb, model='hog')
+                    encs_found = face_recognition.face_encodings(rgb, locs)
+                    detected = []
+                    for e in encs_found:
+                        # use current in-memory DB
+                        with self._lock:
+                            db_encs = list(self._db_encs)
+                            db_names = list(self._db_names)
+                        if db_encs:
+                            try:
+                                dists = face_recognition.face_distance(db_encs, e)
+                                idx = int(np.argmin(dists))
+                                if float(dists[idx]) <= self.tolerance:
+                                    detected.append(db_names[idx])
+                                else:
+                                    detected.append('Unknown')
+                            except Exception:
+                                detected.append('Unknown')
+                        else:
+                            detected.append('Unknown')
+                    # upscale boxes back
+                    boxes = []
+                    for (t, r, b, l) in locs:
+                        boxes.append((l * 2, t * 2, r * 2, b * 2))
+                    # draw on frame and update latest
+                    display = frame.copy()
+                    for (l, t, r, b), nm in zip(boxes, detected):
+                        cv2.rectangle(display, (int(l), int(t)), (int(r), int(b)), (0, 255, 0), 2)
+                        cv2.putText(display, nm if nm else 'Unknown', (int(l), int(t) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    # update latest frame and names
+                    with self._lock:
+                        self.latest_names = detected
+                        # encode jpeg
+                        ret2, jpeg = cv2.imencode('.jpg', display)
+                        if ret2:
+                            self.latest_frame = jpeg.tobytes()
+                            self._last_frame_time = datetime.utcnow().isoformat()
+                    # if any known persons (non-Unknown), save attendance
+                    knowns = [n for n in detected if n and n.lower() != 'unknown']
+                    if knowns:
+                        try:
+                            save_attendance(display, knowns)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            else:
+                # still update latest_frame without boxes
+                with self._lock:
+                    ret2, jpeg = cv2.imencode('.jpg', frame)
+                    if ret2:
+                        self.latest_frame = jpeg.tobytes()
+            time.sleep(0.01)
+        try:
+            cap.release()
+        except Exception:
+            pass
+
+    def get_frame(self):
+        with self._lock:
+            return self.latest_frame
+
+    def get_names(self):
+        with self._lock:
+            return list(self.latest_names)
+
+    def get_last_frame_time(self):
+        with self._lock:
+            return getattr(self, '_last_frame_time', None)
+
+    def reload_db(self):
+        """Force reload of encodings DB from disk into memory."""
+        try:
+            names, encs = load_db(DB_PATH)
+            with self._lock:
+                self._db_names = names
+                self._db_encs = [np.array(e) for e in encs] if encs else []
+                try:
+                    self._db_mtime = DB_PATH.stat().st_mtime
+                except Exception:
+                    self._db_mtime = None
+            return True
+        except Exception:
+            return False
