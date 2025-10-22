@@ -1,0 +1,755 @@
+
+import csv
+import time
+import pickle
+from pathlib import Path
+import cv2
+import numpy as np
+import os
+from datetime import datetime
+from threading import Thread, Lock
+from filelock import FileLock
+from collections import deque
+
+
+# Simple tracker to reduce flicker: IoU-based association + EMA smoothing
+class Track:
+    def __init__(self, bbox, name, track_id, frame_idx, alpha=0.6):
+        # bbox: (left, top, right, bottom) floats
+        self.bbox = [float(v) for v in bbox]
+        self.name = name if name and name.lower() != 'unknown' else None
+        self.id = track_id
+        self.last_seen = frame_idx
+        self.alpha = alpha
+
+    def update(self, bbox, name, frame_idx):
+        # bbox incoming as (left, top, right, bottom)
+        # EMA smoothing
+        for i in range(4):
+            self.bbox[i] = self.alpha * float(bbox[i]) + (1 - self.alpha) * self.bbox[i]
+        if name and name.lower() != 'unknown':
+            self.name = name
+        self.last_seen = frame_idx
+
+    def get_display(self):
+        # return ints
+        l, t, r, b = [int(round(v)) for v in self.bbox]
+        return (t, r, b, l), (l, t, r, b)
+
+
+def iou_box(a, b):
+    # a,b are (left, top, right, bottom)
+    left = max(a[0], b[0])
+    top = max(a[1], b[1])
+    right = min(a[2], b[2])
+    bottom = min(a[3], b[3])
+    if right <= left or bottom <= top:
+        return 0.0
+    inter = (right - left) * (bottom - top)
+    area_a = (a[2] - a[0]) * (a[3] - a[1])
+    area_b = (b[2] - b[0]) * (b[3] - b[1])
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+import argparse
+import json
+try:
+    import openpyxl
+    from openpyxl import Workbook
+except Exception:
+    openpyxl = None
+
+try:
+    import face_recognition
+except Exception as e:
+    raise SystemExit('face_recognition is required: ' + str(e))
+
+DB_PATH = Path('data/encodings_db.pkl')
+# Optional InsightFace (RetinaFace + ArcFace) support
+ARCFACE_ENABLED = False
+arc_app = None
+arc_db_path = Path('data/encodings_db_arc.pkl')
+try:
+    from insightface.app import FaceAnalysis
+    import insightface
+    ARCFACE_ENABLED = True
+except Exception:
+    ARCFACE_ENABLED = False
+
+NAME_MAP_CSV = Path('data/name_map.csv')
+ATTENDANCE_DIR = Path('data/attendance')
+ATTENDANCE_LOG = ATTENDANCE_DIR / 'attendance_log.csv'
+ATTENDANCE_XLSX = Path('data/attendance.xlsx')
+# cross-process lock file for the xlsx
+ATTENDANCE_XLSX_LOCK = ATTENDANCE_XLSX.with_suffix('.xlsx.lock')
+
+# path for latest annotated frame to be consumed by web UI
+LIVE_STREAM_JPG = Path('data/live_stream.jpg')
+
+# in-process lock for small critical sections
+excel_lock = Lock()
+
+
+
+CONFIG_PATH = Path('data/config.json')
+
+# ArcFace DB and loading removed
+
+class VideoStream:
+    def __init__(self, src=0, reconnect=True, reconnect_interval=2.0):
+        self.src = src
+        self.reconnect = reconnect
+        self.reconnect_interval = reconnect_interval
+        self.stream = None
+        self._open_stream()
+        # Optimize camera settings when available
+        try:
+            self.stream.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Minimize buffer
+            self.stream.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            self.stream.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            self.stream.set(cv2.CAP_PROP_FPS, 30)
+        except Exception:
+            pass
+        self.stopped = False
+        self.frame = None
+        self.lock = Lock()
+        self.detection_thread = None
+        self.results = []
+        self.detecting = False
+
+    def _open_stream(self):
+        # src can be int (device index) or URL
+        try:
+            self.stream = cv2.VideoCapture(self.src)
+        except Exception:
+            self.stream = None
+
+    def start(self):
+        Thread(target=self.update, args=(), daemon=True).start()
+        return self
+
+    def update(self):
+        while not self.stopped:
+            if self.stream is None:
+                if not self.reconnect:
+                    break
+                time.sleep(self.reconnect_interval)
+                self._open_stream()
+                continue
+
+            ret, frame = self.stream.read()
+            if not ret or frame is None:
+                # if source is network-like (string), attempt reconnect
+                if self.reconnect and isinstance(self.src, str):
+                    try:
+                        self.stream.release()
+                    except Exception:
+                        pass
+                    self.stream = None
+                    time.sleep(self.reconnect_interval)
+                    self._open_stream()
+                    continue
+                else:
+                    break
+
+            with self.lock:
+                self.frame = frame
+            time.sleep(0.001)  # Tiny sleep to prevent CPU spin
+
+        try:
+            if self.stream is not None:
+                self.stream.release()
+        except Exception:
+            pass
+                
+    def read(self):
+        with self.lock:
+            return self.frame
+            
+    def start_detection(self, frame, db_names, db_encs, tolerance):
+        if self.detecting:
+            return
+        self.detecting = True
+        self.detection_thread = Thread(
+            target=self._detect_faces,
+            args=(frame.copy(), db_names, db_encs, tolerance),
+            daemon=True
+        )
+        self.detection_thread.start()
+        
+    def _detect_faces(self, frame, db_names, db_encs, tolerance):
+        try:
+            # Convert to RGB once
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = []
+            # Try ArcFace (InsightFace) first if available
+            if ARCFACE_ENABLED:
+                if arc_app is None:
+                    init_arcface()
+                if arc_app is not None and arc_encs:
+                    try:
+                        faces = arc_app.get(frame_rgb)
+                        for f in faces:
+                            x1, y1, x2, y2 = [int(v) for v in f.bbox]
+                            emb = f.embedding
+                            vec = np.array(emb, dtype=np.float32)
+                            norm = np.linalg.norm(vec)
+                            if norm > 0:
+                                vec = vec / norm
+                            sims = np.dot(np.stack(arc_encs, axis=0), vec)
+                            idx = int(np.argmax(sims))
+                            best_sim = float(sims[idx])
+                            cand_name = arc_names[idx]
+                            print(f"[ARCFACE] best_sim={best_sim:.4f} idx={idx} name={cand_name} threshold={ARC_COSINE_THRESHOLD}")
+                            if best_sim >= ARC_COSINE_THRESHOLD:
+                                name = cand_name
+                            else:
+                                name = 'Unknown'
+                            loc = (y1, x2, y2, x1)
+                            results.append((loc, name, float(best_sim), 'arc'))
+                        with self.lock:
+                            self.results = results
+                        return
+                    except Exception as e:
+                        print('ArcFace detection error, falling back:', e)
+
+            # Fallback: use face_recognition HOG detector
+            face_locations = face_recognition.face_locations(frame_rgb, model='hog')
+            if face_locations:
+                encodings = face_recognition.face_encodings(frame_rgb, face_locations)
+                for loc, enc in zip(face_locations, encodings):
+                    # debug distances for face_recognition
+                    if db_encs:
+                        distances = face_recognition.face_distance(db_encs, enc)
+                        best_i = int(np.argmin(distances))
+                        best_d = float(distances[best_i])
+                        cand_name = db_names[best_i]
+                        print(f"[HOG] best_distance={best_d:.4f} idx={best_i} name={cand_name} tolerance={tolerance}")
+                        # decide
+                        if best_d <= tolerance:
+                            name = cand_name
+                        else:
+                            name = 'Unknown'
+                        results.append((loc, name, float(best_d), 'hog'))
+                    else:
+                        results.append((loc, 'Unknown', float('inf'), 'hog'))
+            
+            with self.lock:
+                self.results = results
+        finally:
+            self.detecting = False
+        
+    def get_results(self):
+        with self.lock:
+            return self.results.copy()
+        
+    def stop(self):
+        self.stopped = True
+
+def load_name_map(csv_path: Path):
+   
+    m = {}
+    if not csv_path.exists():
+        return m
+    with open(csv_path, newline='', encoding='utf-8') as f:
+        r = csv.reader(f)
+        for row in r:
+            if not row: continue
+            key = row[0].strip()
+            friendly = row[1].strip() if len(row) > 1 else key
+            m[key] = friendly
+    return m
+
+def load_db(path: Path):
+    # ...existing code...
+    with open(path, 'rb') as f:
+        db = pickle.load(f)
+    names = []
+    encodings = []
+    for name, encs in db.items():
+        for e in encs:
+            names.append(name)
+            encodings.append(np.array(e))
+    return names, encodings
+
+
+def load_raw_db(path: Path):
+    """Load the raw pickle DB (name->list[emb]) without flattening."""
+    if not path.exists():
+        return {}
+    with open(path, 'rb') as f:
+        return pickle.load(f)
+
+
+# ArcFace helpers
+arc_names = []
+arc_encs = []
+ARC_COSINE_THRESHOLD = 0.35
+
+def init_arcface():
+    global arc_app
+    if not ARCFACE_ENABLED:
+        return None
+    try:
+        arc_app = FaceAnalysis(allowed_modules=['detection', 'recognition'])
+        arc_app.prepare(ctx_id=-1, det_size=(640, 640))
+        return arc_app
+    except Exception as e:
+        print('InsightFace initialization failed:', e)
+        return None
+
+
+def load_arc_db(path: Path):
+    global arc_names, arc_encs
+    if not path.exists():
+        return False
+    try:
+        with open(path, 'rb') as f:
+            db = pickle.load(f)
+        arc_names = []
+        arc_encs = []
+        for name, embs in db.items():
+            for e in embs:
+                vec = np.array(e, dtype=np.float32)
+                norm = np.linalg.norm(vec)
+                if norm > 0:
+                    vec = vec / norm
+                arc_names.append(name)
+                arc_encs.append(vec)
+        return True
+    except Exception as e:
+        print('Failed to load arc DB:', e)
+        return False
+
+
+def calibrate(arc_path: Path, fr_path: Path):
+    """Analyze embeddings in both ArcFace and face_recognition DBs and print stats.
+
+    Returns suggested (arc_threshold, fr_tolerance).
+    """
+    suggestions = {}
+    # ArcFace calibration
+    if arc_path.exists():
+        raw = load_raw_db(arc_path)
+        normed = {n: [(np.array(e, dtype=np.float32)/(np.linalg.norm(e)+1e-8)) for e in embs] for n, embs in raw.items()}
+        all_intra = []
+        all_inter = []
+        names = list(normed.keys())
+        for n, vecs in normed.items():
+            sims = []
+            for i in range(len(vecs)):
+                for j in range(i+1, len(vecs)):
+                    sims.append(float(np.dot(vecs[i], vecs[j])))
+            if sims:
+                all_intra.extend(sims)
+        for i in range(len(names)):
+            for j in range(i+1, len(names)):
+                vi = normed.get(names[i], [])
+                vj = normed.get(names[j], [])
+                for a in vi:
+                    for b in vj:
+                        all_inter.append(float(np.dot(a, b)))
+        print('\n=== ArcFace calibration ===')
+        if all_intra:
+            print(f'Per-person intra similarities: mean={np.mean(all_intra):.4f} min={np.min(all_intra):.4f} max={np.max(all_intra):.4f} std={np.std(all_intra):.4f}')
+        else:
+            print('Not enough samples per person to compute intra-person similarities (need >=2 images per person).')
+        if all_inter:
+            print(f'Inter-person similarities: mean={np.mean(all_inter):.4f} min={np.min(all_inter):.4f} max={np.max(all_inter):.4f} std={np.std(all_inter):.4f}')
+        if all_intra and all_inter:
+            suggested = float((np.min(all_intra) + np.max(all_inter)) / 2.0)
+            print(f'Suggested ARC cosine threshold (midpoint): {suggested:.4f}')
+        elif all_intra:
+            suggested = float(np.min(all_intra) - 0.05)
+            print(f'Suggested ARC cosine threshold (based on intra only): {suggested:.4f}')
+        else:
+            suggested = ARC_COSINE_THRESHOLD
+            print(f'Fallback ARC threshold: {suggested:.4f}')
+        suggestions['arc'] = suggested
+    else:
+        print('\nNo ArcFace DB found for calibration at', arc_path)
+
+    # face_recognition DB distances (lower is better)
+    if fr_path.exists():
+        raw_fr = load_raw_db(fr_path)
+        all_intra = []
+        all_inter = []
+        names = list(raw_fr.keys())
+        # intra: L2 distances between encodings of same person
+        encs_per = {n: [np.array(e, dtype=np.float32) for e in embs] for n, embs in raw_fr.items()}
+        for n, vecs in encs_per.items():
+            dists = []
+            for i in range(len(vecs)):
+                for j in range(i+1, len(vecs)):
+                    dists.append(float(np.linalg.norm(vecs[i] - vecs[j])))
+            if dists:
+                all_intra.extend(dists)
+        # inter: distances between different persons (sampled)
+        for i in range(len(names)):
+            for j in range(i+1, len(names)):
+                vi = encs_per.get(names[i], [])
+                vj = encs_per.get(names[j], [])
+                for a in vi:
+                    for b in vj:
+                        all_inter.append(float(np.linalg.norm(a - b)))
+
+        print('\n=== face_recognition (HOG) calibration ===')
+        if all_intra:
+            print(f'Per-person intra distances: mean={np.mean(all_intra):.4f} min={np.min(all_intra):.4f} max={np.max(all_intra):.4f} std={np.std(all_intra):.4f}')
+        else:
+            print('Not enough samples per person to compute intra-person distances (need >=2 images per person).')
+        if all_inter:
+            print(f'Inter-person distances: mean={np.mean(all_inter):.4f} min={np.min(all_inter):.4f} max={np.max(all_inter):.4f} std={np.std(all_inter):.4f}')
+
+        # Suggest tolerance: choose value between max(intra) and min(inter) if possible, else conservative
+        if all_intra and all_inter:
+            suggested = float((np.max(all_intra) + np.min(all_inter)) / 2.0)
+            print(f'Suggested face_recognition tolerance (midpoint): {suggested:.4f}')
+        elif all_intra:
+            suggested = float(np.max(all_intra) + 0.1)
+            print(f'Suggested face_recognition tolerance (based on intra only): {suggested:.4f}')
+        else:
+            suggested = 0.45
+            print(f'Fallback face_recognition tolerance: {suggested:.4f}')
+        suggestions['fr'] = suggested
+    else:
+        print('\nNo face_recognition DB found for calibration at', fr_path)
+
+    return suggestions
+
+def best_match_name(enc, db_names, db_encodings, tolerance=0.5):
+    # ...existing code...
+    if not db_encodings:
+        return 'Unknown'
+    distances = face_recognition.face_distance(db_encodings, enc)
+    idx = int(np.argmin(distances))
+    if distances[idx] <= tolerance:
+        return db_names[idx]
+    return 'Unknown'
+
+
+
+def save_attendance(frame, names):
+    ATTENDANCE_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    img_path = ATTENDANCE_DIR / f'attendance_{timestamp}.jpg'
+    cv2.imwrite(str(img_path), frame)
+    # Save names to CSV
+    with open(ATTENDANCE_LOG, 'a', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow([timestamp, ', '.join(names), str(img_path)])
+    # Also update Excel workbook (log + summary)
+    try:
+        update_attendance_xlsx(names, timestamp, str(img_path))
+    except Exception as e:
+        print('Failed to update Excel attendance:', e)
+
+
+def update_attendance_xlsx(names, timestamp, img_path):
+    """Append to Log sheet and add a new row to Summary for each attendance mark: Name, Date, Time."""
+    if openpyxl is None:
+        print('openpyxl not installed; skipping Excel attendance write')
+        return
+
+    # Parse timestamp to date and time
+    try:
+        dt = datetime.strptime(timestamp, '%Y%m%d_%H%M%S')
+        date_str = dt.strftime('%Y-%m-%d')
+        time_str = dt.strftime('%H:%M:%S')
+    except Exception:
+        date_str = datetime.now().strftime('%Y-%m-%d')
+        time_str = datetime.now().strftime('%H:%M:%S')
+
+    lock = FileLock(str(ATTENDANCE_XLSX_LOCK))
+    acquired = False
+    try:
+        lock.acquire(timeout=5)
+        acquired = True
+        with excel_lock:
+            if ATTENDANCE_XLSX.exists():
+                wb = openpyxl.load_workbook(ATTENDANCE_XLSX)
+            else:
+                wb = Workbook()
+                log = wb.active
+                log.title = 'Log'
+                log.append(['Timestamp', 'Names', 'ImagePath'])
+                wb.create_sheet('Summary')
+
+            if 'Log' not in wb.sheetnames:
+                wb.create_sheet('Log')
+            log = wb['Log']
+            log.append([timestamp, ', '.join(names), img_path])
+
+            # Summary sheet: append a new row for each mark
+            if 'Summary' not in wb.sheetnames:
+                wb.create_sheet('Summary')
+            summ = wb['Summary']
+            # ensure header row
+            if summ.max_row == 0:
+                summ.append(['Name', 'Date', 'Time'])
+            for n in names:
+                summ.append([n, date_str, time_str])
+
+            wb.save(ATTENDANCE_XLSX)
+    finally:
+        if acquired:
+            try:
+                lock.release()
+            except Exception:
+                pass
+
+
+def augment_db(src_dir: Path, out_dir: Path, copies=3):
+    """Create simple augmentations (flip, small rotations) for each known image into out_dir/NAME/"""
+    from PIL import Image
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for person in src_dir.iterdir():
+        if not person.is_dir():
+            continue
+        dst_person = out_dir / person.name
+        dst_person.mkdir(parents=True, exist_ok=True)
+        for img_path in person.glob('*.jpg'):
+            try:
+                img = Image.open(img_path)
+            except Exception:
+                continue
+            # save original
+            img.save(dst_person / img_path.name)
+            for i in range(copies):
+                if i % 3 == 0:
+                    aug = img.transpose(Image.FLIP_LEFT_RIGHT)
+                else:
+                    aug = img.rotate((i * 7) % 25)
+                aug.save(dst_person / f"{img_path.stem}_aug{i}{img_path.suffix}")
+
+
+def save_config(arc_threshold, fr_tolerance):
+    cfg = {'arc_threshold': float(arc_threshold), 'fr_tolerance': float(fr_tolerance)}
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+        json.dump(cfg, f, indent=2)
+    print('Saved config to', CONFIG_PATH)
+
+def main(tolerance=0.45, camera_src=0, headless=False):
+    if not DB_PATH.exists():
+        raise SystemExit(f'Encodings DB not found: {DB_PATH}. Run scripts/build_encodings_db.py first.')
+    db_names, db_encs = load_db(DB_PATH)
+    name_map = load_name_map(NAME_MAP_CSV)
+    print('Loaded DB:', len(db_names), 'encodings')
+    if name_map:
+        print('Loaded name map entries:', len(name_map))
+
+    print('Initializing camera...')
+    # camera_src may be int (device index) or string (rtsp/http url)
+    # If camera_src is a network URL and reconnect flags were passed via CLI, the caller
+    # should have started main with desired reconnect settings. We default reconnect=True for URLs.
+    reconnect_flag = True if isinstance(camera_src, str) else False
+    vs = VideoStream(camera_src, reconnect=reconnect_flag).start()
+    time.sleep(2.0)  # Give more time for camera warmup
+
+    # ArcFace support removed; using face_recognition only
+
+    prev_time = time.time()
+    fps = 0.0
+    if not headless:
+        print('Press ESC/q to quit, SPACE to capture attendance')
+        window_name = 'Live Recognize - ESC/q to quit, SPACE to capture'
+        # Test whether OpenCV GUI functions are available; exit if not
+        try:
+            cv2.imshow(window_name, np.zeros((2,2,3), dtype=np.uint8))
+            cv2.waitKey(1)
+            cv2.destroyAllWindows()
+        except cv2.error:
+            raise SystemExit('OpenCV GUI not available. Please install opencv-python with GUI support or run with --headless')
+    else:
+        window_name = None
+    frame_count = 0
+    detection_interval = 3  # Process every Nth frame
+    # tracker state
+    tracks = []
+    next_track_id = 1
+    IOU_MATCH_THRESHOLD = 0.3
+    TRACK_EXPIRE_FRAMES = 15
+    
+    while True:
+        frame = vs.read()
+        if frame is None:
+            continue
+
+        frame_count += 1
+        start = time.time()
+
+        # Start background face detection periodically
+        if frame_count % detection_interval == 0:
+            vs.start_detection(frame, db_names, db_encs, tolerance)
+
+        # Get latest detection results
+        results = vs.get_results()
+        detected_names = []
+
+        # convert detection format to (left, top, right, bottom, name)
+        dets = []
+        for res in results:
+            if len(res) == 2:
+                (top, right, bottom, left), key = res
+                name = name_map.get(key, key)
+            else:
+                (top, right, bottom, left), key, score, method = res
+                name = name_map.get(key, key)
+            dets.append((left, top, right, bottom, name))
+
+        # match detections to existing tracks via IoU
+        assigned = set()
+        for det in dets:
+            l, t, r, b, name = det
+            best_i = None
+            best_iou = 0.0
+            for i, tr in enumerate(tracks):
+                tr_l, tr_t, tr_r, tr_b = tr.bbox[3], tr.bbox[0], tr.bbox[1], tr.bbox[2]
+                iou = iou_box((l, t, r, b), (tr_l, tr_t, tr_r, tr_b))
+                if iou > best_iou:
+                    best_iou = iou
+                    best_i = i
+            if best_i is not None and best_iou >= IOU_MATCH_THRESHOLD:
+                tracks[best_i].update((l, t, r, b), name, frame_count)
+                assigned.add(best_i)
+            else:
+                # create new track
+                tr = Track((l, t, r, b), name, next_track_id, frame_count)
+                next_track_id += 1
+                tracks.append(tr)
+
+        # expire old tracks and draw
+        new_tracks = []
+        for tr in tracks:
+            if (frame_count - tr.last_seen) <= TRACK_EXPIRE_FRAMES:
+                loc, bbox_int = tr.get_display()
+                (left, top, right, bottom) = bbox_int[0], bbox_int[1], bbox_int[2], bbox_int[3]
+                display_name = tr.name if tr.name is not None else 'Unknown'
+                cv2.rectangle(frame, (left, top), (right, bottom), (0, 255, 0), 2)
+                cv2.putText(frame, display_name, (left, top - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
+                detected_names.append(display_name)
+                new_tracks.append(tr)
+        tracks = new_tracks
+
+        # compute FPS
+        end = time.time()
+        dt = end - prev_time
+        prev_time = end
+        fps = 0.9 * fps + 0.1 * (1.0 / dt) if dt > 0 else fps
+
+        title = f'Live Recognize - FPS: {fps:.1f} - ESC/q to quit, SPACE to capture'
+        # write annotated frame for web UI (atomic write)
+        try:
+            if LIVE_STREAM_JPG.parent:
+                LIVE_STREAM_JPG.parent.mkdir(parents=True, exist_ok=True)
+            tmp = str(LIVE_STREAM_JPG) + '.tmp'
+            # Diagnostic: log write attempt and result so calling process can inspect
+            try:
+                wrote = cv2.imwrite(tmp, frame)
+                print(f'Attempted write tmp={tmp} wrote={wrote}')
+                if wrote:
+                    try:
+                        os.replace(tmp, str(LIVE_STREAM_JPG))
+                        print(f'Replaced {LIVE_STREAM_JPG} successfully')
+                    except Exception as e:
+                        print('os.replace failed:', e, 'trying copy fallback')
+                        import shutil
+                        try:
+                            shutil.copy(tmp, str(LIVE_STREAM_JPG))
+                            print(f'Copied {tmp} -> {LIVE_STREAM_JPG}')
+                        except Exception as e2:
+                            print('shutil.copy failed:', e2)
+                        try:
+                            os.remove(tmp)
+                        except Exception:
+                            pass
+                else:
+                    # cv2.imwrite returned False; try to write via imencode as fallback
+                    try:
+                        _, enc = cv2.imencode('.jpg', frame)
+                        if enc is not None:
+                            with open(str(LIVE_STREAM_JPG), 'wb') as f:
+                                f.write(enc.tobytes())
+                            print(f'Wrote {LIVE_STREAM_JPG} via imencode fallback')
+                    except Exception as e3:
+                        print('imencode fallback failed:', e3)
+            except Exception as e:
+                print('Exception while attempting to write live frame:', e)
+        except Exception:
+            pass
+
+        # handle GUI vs headless modes
+        if not headless:
+            try:
+                cv2.imshow(window_name, frame)
+                key = cv2.waitKey(1) & 0xFF
+            except cv2.error as e:
+                raise SystemExit(f'OpenCV imshow failed: {e}')
+
+            if key == 27 or key == ord('q'):
+                print("Quit key pressed, exiting loop.")
+                break
+            elif key == 32:  # SPACE pressed
+                if detected_names:
+                    save_attendance(frame, detected_names)
+                    print(f'Attendance captured: {detected_names}')
+                else:
+                    print('No faces detected for attendance.')
+        else:
+            # In headless/background mode: auto-save attendance when new faces are detected (rate-limited)
+            try:
+                if detected_names:
+                    if 'last_saved_names' not in globals():
+                        globals()['last_saved_names'] = set()
+                        globals()['last_saved_time'] = 0
+                    curset = set([n for n in detected_names if n and n.lower() != 'unknown'])
+                    nowt = time.time()
+                    if curset and (curset != globals().get('last_saved_names', set())) and (nowt - globals().get('last_saved_time', 0) > 5):
+                        save_attendance(frame, list(curset))
+                        globals()['last_saved_names'] = curset
+                        globals()['last_saved_time'] = nowt
+                        print('Auto-saved attendance for', list(curset))
+            except Exception:
+                pass
+
+    vs.stop()
+    cv2.destroyAllWindows()
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Live face recognition (GUI only)')
+    parser.add_argument('--arc-threshold', type=float, default=ARC_COSINE_THRESHOLD,
+                        help='ArcFace cosine similarity threshold (0..1)')
+    parser.add_argument('--tolerance', type=float, default=0.45,
+                        help='face_recognition distance tolerance (lower is stricter)')
+    parser.add_argument('--calibrate', action='store_true', help='Run calibration on the existing DBs and exit')
+    parser.add_argument('--augment-db', action='store_true', help='Create augmented copies of data/known into data/known_aug')
+    parser.add_argument('--augment-copies', type=int, default=3, help='Number of augmentations per image')
+    parser.add_argument('--save-config', action='store_true', help='Save the provided thresholds to data/config.json')
+    parser.add_argument('--camera', '--source', dest='camera', default=None,
+                        help='Camera source: integer device index (0) or RTSP/HTTP URL. If omitted defaults to 0.')
+    parser.add_argument('--reconnect', dest='reconnect', action='store_true', default=False,
+                        help='Enable automatic reconnect for network camera sources (RTSP/HTTP)')
+    parser.add_argument('--reconnect-interval', dest='reconnect_interval', type=float, default=2.0,
+                        help='Seconds between reconnect attempts for network sources')
+    parser.add_argument('--headless', action='store_true', help='Run without OpenCV GUI (background mode)')
+    args = parser.parse_args()
+    if args.calibrate:
+        suggestions = calibrate(arc_db_path, DB_PATH)
+        print('\nCalibration suggestions:', suggestions)
+    elif args.augment_db:
+        src_known = Path('data/known')
+        out_known = Path('data/known_aug')
+        augment_db(src_known, out_known, copies=args.augment_copies)
+        print('Augmented DB saved to', out_known)
+    else:
+        if args.save_config:
+            save_config(args.arc_threshold, args.tolerance)
+        # Determine camera source
+        cam = args.camera if args.camera is not None else 0
+        # convert numeric strings to int
+        try:
+            if isinstance(cam, str) and cam.isdigit():
+                cam = int(cam)
+        except Exception:
+            pass
+        main(tolerance=args.tolerance, camera_src=cam, headless=args.headless)
