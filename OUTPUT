@@ -1,0 +1,104 @@
+from flask import Flask, render_template, send_file, jsonify, request, redirect, url_for, session, send_from_directory
+import openpyxl
+import os
+import time
+import cv2
+import pickle
+import io
+import sys
+import numpy as np
+from werkzeug.utils import secure_filename
+from werkzeug.security import generate_password_hash, check_password_hash
+import shutil
+import face_recognition
+
+try:
+    from deploy.recognizer import Recognizer
+except Exception:
+    try:
+        from recognizer import Recognizer
+    except Exception:
+        try:
+            from .recognizer import Recognizer
+        except Exception:
+            Recognizer = None
+
+app = Flask(__name__)
+app.secret_key = 'attmanege-secret-key'  # Change for production
+
+import secrets
+
+KNOWN_DIR = os.path.join(os.path.dirname(__file__), '..', 'data', 'known')
+ENCODINGS_DB = os.path.join(os.path.dirname(__file__), '..', 'data', 'encodings_db.pkl')
+
+
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+  
+    if not session.get('user'):
+        return redirect(url_for('login'))
+    error = None
+    success = None
+    if request.method == 'POST':
+        name = request.form['name'].strip()
+        enroll = request.form['enroll'].strip()
+        password = request.form.get('password', '').strip()
+        files = request.files.getlist('photos')
+        if not name or not enroll:
+            error = 'Name and enrollment number required.'
+        elif not password:
+            error = 'Please provide a password for student account.'
+        elif len(files) < 10:
+            error = 'Please upload at least 10 photos.'
+        else:
+            # Save images to known/name_enroll/
+            student_dir = os.path.join(KNOWN_DIR, f"{secure_filename(name)}_{secure_filename(enroll)}")
+            os.makedirs(student_dir, exist_ok=True)
+            for i, f in enumerate(files):
+                fname = f"{i+1}_{secure_filename(f.filename)}"
+                f.save(os.path.join(student_dir, fname))
+            encodings = []
+            for imgfile in os.listdir(student_dir):
+                imgpath = os.path.join(student_dir, imgfile)
+                try:
+                    image = face_recognition.load_image_file(imgpath)
+                    faces = face_recognition.face_encodings(image)
+                    if faces:
+                        encodings.append(faces[0])
+                except Exception:
+                    continue
+           
+            db = {}
+            import pickle
+            if os.path.exists(ENCODINGS_DB):
+                with open(ENCODINGS_DB, 'rb') as f:
+                    try:
+                        db = pickle.load(f)
+                    except Exception:
+                        db = {}
+            db[f"{name}_{enroll}"] = [list(map(float, e)) for e in encodings]
+            os.makedirs(os.path.dirname(ENCODINGS_DB), exist_ok=True)
+            with open(ENCODINGS_DB, 'wb') as f:
+                pickle.dump(db, f, protocol=pickle.HIGHEST_PROTOCOL)
+            # If recognizer is running, force reload
+            try:
+                if RECOGNIZER is not None:
+                    RECOGNIZER.reload_db()
+            except Exception:
+                pass
+            success = f"Student {name} ({enroll}) registered successfully! {len(encodings)} faces encoded."
+       
+            students = load_students()
+            students[f"{enroll}"] = {
+                'name': name,
+                'enroll': enroll,
+                'password': generate_password_hash(password),
+                'approved': False,
+                'registered_on': __import__('datetime').datetime.utcnow().isoformat()
+            }
+            save_students(students)
+    return render_template('register.html', error=error, success=success)
+
+COLLEGE_NAME = "Raajdhani Engineering College"
+SITE_TITLE = "attmanege"
+EXCEL_PATH = os.path.join(os.path.dirname(__file__), '..', 'data', 'attendance.xlsx')
