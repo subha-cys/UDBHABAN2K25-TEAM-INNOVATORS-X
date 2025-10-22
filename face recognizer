@@ -1,0 +1,125 @@
+
+import os
+import argparse
+import pickle
+import sys
+from pathlib import Path
+
+try:
+    import cv2
+    import numpy as np
+    import face_recognition
+except Exception as e:
+    print('Missing dependency:', e)
+    print('Install requirements with: pip install -r requirements.txt')
+    raise
+
+
+ROOT = Path(__file__).resolve().parent
+DATA_DIR = ROOT / 'data'
+KNOWN_DIR = DATA_DIR / 'known'
+DB_PATH = DATA_DIR / 'encodings_db.pkl'
+
+
+def build_db(min_faces_per_person=1):
+    """Scan data/known/<person>/ images and build a pickle DB mapping name->list[encodings]."""
+    db = {}
+    if not KNOWN_DIR.exists():
+        print('No known directory found at', KNOWN_DIR)
+        return
+    for person_dir in sorted(KNOWN_DIR.iterdir()):
+        if not person_dir.is_dir():
+            continue
+        name = person_dir.name
+        encs = []
+        for img_path in sorted(person_dir.glob('*')):
+            try:
+                img = face_recognition.load_image_file(str(img_path))
+                faces = face_recognition.face_encodings(img)
+                if faces:
+                    encs.append(faces[0].tolist())
+                    print(f'Encoded {img_path} -> {name}')
+            except Exception as e:
+                print('Failed to process', img_path, e)
+        if len(encs) >= min_faces_per_person:
+            db[name] = encs
+    if not DB_PATH.parent.exists():
+        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(DB_PATH, 'wb') as f:
+        pickle.dump(db, f, protocol=pickle.HIGHEST_PROTOCOL)
+    print('Saved encodings DB to', DB_PATH, 'entries=', len(db))
+
+
+def load_db():
+    if not DB_PATH.exists():
+        print('Encodings DB not found at', DB_PATH)
+        return {}, []
+    with open(DB_PATH, 'rb') as f:
+        db = pickle.load(f)
+    names = []
+    encs = []
+    for name, lst in db.items():
+        for e in lst:
+            names.append(name)
+            encs.append(np.array(e))
+    return db, (names, encs)
+
+
+def camera_recognize(tolerance=0.45, device=0):
+    db, (names, encs) = load_db()
+    if not db:
+        print('Encodings DB empty; run --build-db first')
+        return
+    print('Starting camera on device', device)
+    cap = cv2.VideoCapture(device)
+    if not cap.isOpened():
+        print('Failed to open camera', device)
+        return
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            small = cv2.resize(frame, (0, 0), fx=0.5, fy=0.5)
+            rgb = small[:, :, ::-1]
+            locs = face_recognition.face_locations(rgb)
+            encs_frame = face_recognition.face_encodings(rgb, locs)
+            for (top, right, bottom, left), enc in zip(locs, encs_frame):
+                # scale back up
+                top *= 2; right *= 2; bottom *= 2; left *= 2
+                name = 'Unknown'
+                if encs:
+                    dists = face_recognition.face_distance(encs, enc)
+                    idx = int(np.argmin(dists))
+                    if dists[idx] <= tolerance:
+                        name = names[idx]
+                cv2.rectangle(frame, (left, top), (right, bottom), (0, 255, 0), 2)
+                cv2.putText(frame, name, (left, top - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            cv2.imshow('Recognize (q to quit)', frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+    finally:
+        try:
+            cap.release()
+        except Exception:
+            pass
+        cv2.destroyAllWindows()
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Small recognizer helper')
+    parser.add_argument('--build-db', action='store_true', help='Build encodings DB from data/known')
+    parser.add_argument('--camera', action='store_true', help='Open camera and recognize (press q to quit)')
+    parser.add_argument('--tolerance', type=float, default=0.45, help='face_recognition tolerance')
+    parser.add_argument('--device', type=int, default=0, help='camera device index')
+    args = parser.parse_args()
+    if args.build_db:
+        build_db()
+    elif args.camera:
+        camera_recognize(tolerance=args.tolerance, device=args.device)
+    else:
+        parser.print_help()
+
+
+if __name__ == '__main__':
+    main()
