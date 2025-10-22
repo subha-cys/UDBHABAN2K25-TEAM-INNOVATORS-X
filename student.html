@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Student Dashboard | attmanege</title>
+    <link href="https://fonts.googleapis.com/css?family=Montserrat:700,900&display=swap" rel="stylesheet">
+    <style>
+        :root{--accent1:#6dd5ed;--accent2:#2193b0}
+        html,body{height:100%;margin:0;font-family:Montserrat,system-ui}
+        body{display:flex;align-items:center;justify-content:center;background:linear-gradient(180deg,var(--accent1),var(--accent2));padding:28px}
+        .container{width:clamp(360px,780px,980px);background:linear-gradient(180deg,rgba(255,255,255,0.96),rgba(255,255,255,0.9));padding:22px;border-radius:16px;box-shadow:0 20px 60px rgba(4,22,30,0.28);position:relative}
+        .container::before{content:'';position:absolute;right:-60px;top:-60px;width:420px;height:420px;background-image:url('/static/logo.png');background-size:contain;background-repeat:no-repeat;opacity:0.06}
+        h1{margin:0;color:var(--accent2);font-weight:900;font-size:1.6rem}
+        .grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px}
+        .stat{background:rgba(255,255,255,0.86);padding:14px;border-radius:10px;box-shadow:0 8px 24px rgba(8,30,40,0.06)}
+        .big{font-size:2rem;font-weight:900;color:#0b3a47}
+        .btn{display:inline-block;padding:10px 14px;border-radius:10px;border:0;background:linear-gradient(90deg,var(--accent1),var(--accent2));color:#fff;font-weight:800;cursor:pointer}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Welcome, {{ student.name if student else student.enroll }}</h1>
+        <div class="grid">
+            <div class="stat">
+                <h4>Attendance</h4>
+                <div class="big">{{ stats.percentage if stats.percentage is not none else 'N/A' }}%</div>
+            </div>
+            <div class="stat">
+                <h4>Score</h4>
+                <div class="big">{{ stats.score if stats.score is not none else 'N/A' }} / 10</div>
+            </div>
+            <div class="stat">
+                <h4>Rank</h4>
+                <div class="big">{{ rank if rank is not none else 'Unranked' }}</div>
+                <small>Streak: <strong>{{ streak }}</strong></small>
+            </div>
+            <div class="stat">
+                <h4>Update Photos</h4>
+                <form method="post" action="/student_reupload" enctype="multipart/form-data">
+                    <input type="hidden" name="enroll" value="{{ student.enroll }}">
+                    <input type="file" name="photos" accept="image/*" multiple required>
+                    <div style="margin-top:8px;"><button class="btn" type="submit">Upload & Update</button></div>
+                </form>
+                <div style="margin-top:8px;"><a class="btn" href="/forgot_password">Forgot/Reset</a></div>
+            </div>
+        </div>
+        <div style="margin-top:14px;display:grid;grid-template-columns:1fr 1fr;gap:12px;" class="stat">
+            <div style="padding:14px;border-radius:10px;background:rgba(255,255,255,0.86)">
+                <h4>Attendance Over Time</h4>
+                <canvas id="chart-attendance" style="width:100%;height:200px"></canvas>
+            </div>
+            <div style="padding:14px;border-radius:10px;background:rgba(255,255,255,0.86)">
+                <h4>Statistics</h4>
+                <div id="student-stats" style="margin-top:8px">Loading stats...</div>
+            </div>
+        </div>
+        <!-- Chart.js CDN for lightweight charts -->
+        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+        <script>
+            async function loadStudentCharts(){
+                // placeholder: fetch simple attendance timeseries from attendance API or synthesize from Summary
+                try{
+                    // For now synthesize a small dataset
+                    const labels = ['Week 1','Week 2','Week 3','Week 4','Week 5'];
+                    const data = [80,85,78,90,88];
+                    const ctx = document.getElementById('chart-attendance').getContext('2d');
+                    new Chart(ctx, {type:'line',data:{labels:labels,datasets:[{label:'% attendance',data:data,fill:true,backgroundColor:'rgba(107,140,255,0.12)',borderColor:'rgba(107,140,255,0.9)',tension:0.3}]},options:{scales:{y:{beginAtZero:true,max:100}}}});
+                    document.getElementById('student-stats').innerHTML = `<div>Present: <strong>{{ stats.raw.present_count or 'N/A' }}</strong></div><div>Total Sessions: <strong>{{ stats.raw.sessions or 'N/A' }}</strong></div><div>Streak: <strong>{{ streak }}</strong></div>`;
+                }catch(e){ console.error(e); document.getElementById('student-stats').innerText='Failed to load charts'; }
+            }
+            loadStudentCharts();
+        </script>
+        <div style="display:flex;gap:12px;justify-content:center;margin-top:18px">
+            <a class="btn" href="/">Home</a>
+            <a class="btn" href="/logout">Logout</a>
+        </div>
+    </div>
+</body>
+</html>
