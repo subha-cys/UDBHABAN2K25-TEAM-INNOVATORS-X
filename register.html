@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Student Registration | attmanege</title>
+    <link href="https://fonts.googleapis.com/css?family=Montserrat:700,900&display=swap" rel="stylesheet">
+    <style>
+        body { background: linear-gradient(135deg, #6dd5ed, #2193b0); font-family: 'Montserrat', sans-serif; margin: 0; min-height: 100vh; }
+        .container { max-width: 500px; margin: 40px auto; background: #fff; border-radius: 20px; box-shadow: 0 8px 32px rgba(33,147,176,0.2); padding: 32px 40px 40px 40px; animation: fadeIn 1.2s; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(40px); } to { opacity: 1; transform: translateY(0); } }
+        h1 { font-size: 2em; font-weight: 900; color: #2193b0; text-align: center; margin-bottom: 1em; }
+        label { font-weight: 700; color: #2193b0; }
+        input[type=text], input[type=number] { width: 100%; padding: 12px; margin: 8px 0 16px 0; border: 1px solid #6dd5ed; border-radius: 8px; font-size: 1em; }
+        input[type=file] { margin-bottom: 16px; }
+        .btn { width: 100%; background: linear-gradient(90deg, #6dd5ed, #2193b0); color: #fff; font-weight: 700; border: none; border-radius: 12px; padding: 14px; font-size: 1.1em; cursor: pointer; box-shadow: 0 4px 16px rgba(33,147,176,0.15); transition: transform 0.2s, box-shadow 0.2s; }
+        .btn:hover { transform: scale(1.05); box-shadow: 0 8px 32px rgba(33,147,176,0.25); }
+        .error { color: #d32f2f; text-align: center; margin-bottom: 1em; }
+        .success { color: #388e3c; text-align: center; margin-bottom: 1em; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Student Registration</h1>
+        {% if error %}<div class="error">{{ error }}</div>{% endif %}
+        {% if success %}<div class="success">{{ success }}</div>{% endif %}
+        <form method="post" enctype="multipart/form-data">
+            <label for="name">Name</label>
+            <input type="text" id="name" name="name" required>
+            <label for="enroll">Enrollment Number</label>
+            <input type="text" id="enroll" name="enroll" required>
+            <label for="password">Account Password</label>
+            <input type="password" id="password" name="password" required>
+            <label for="photos">Upload 10+ Photos</label>
+            <input type="file" id="photos" name="photos" accept="image/*" multiple required>
+            <button class="btn" type="submit">Register Student</button>
+        </form>
+    </div>
+</body>
+</html>
