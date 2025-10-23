@@ -2,71 +2,55 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Admin Dashboard | attmanege</title>
+    <title>Admin Login | attmanege</title>
     <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@700;900&family=Inter:wght@400;600&display=swap" rel="stylesheet">
     <style>
-        :root{--bg-1:#071225;--bg-2:#061028;--neon-a:#00ffd5;--neon-b:#6b8cff;--neon-c:#ff4d94}
-        html,body{height:100%;margin:0;font-family:Inter,Montserrat,system-ui;background:linear-gradient(180deg,var(--bg-1),var(--bg-2));color:#e8fbff}
-        body::after{content:'';position:fixed;inset:0;background-image:radial-gradient(rgba(255,255,255,0.02) 1px, transparent 1px);background-size:100px 100px;opacity:0.5;mix-blend-mode:overlay;pointer-events:none}
-        .container{width:clamp(760px,92%,1200px);margin:36px auto;border-radius:18px;padding:26px;background:linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01));box-shadow:0 40px 100px rgba(0,0,0,0.7);position:relative;overflow:visible}
-        .container::after{content:'';position:absolute;right:-60px;top:-40px;width:420px;height:420px;background-image:url('/static/logo.png');background-size:contain;background-repeat:no-repeat;opacity:0.06;transform:rotate(-12deg)}
-        h1{font-size:1.9rem;margin:0;color:var(--neon-b);font-weight:900;text-shadow:0 6px 28px rgba(107,140,255,0.06)}
-        h2{margin:6px 0 18px;color:#cfeeff}
-    .btn{position:relative;display:inline-flex;align-items:center;gap:10px;padding:10px 14px;border-radius:12px;border:0;font-weight:800;cursor:pointer;background:linear-gradient(90deg,var(--neon-b),var(--neon-a));color:#022;overflow:hidden;transition:transform .18s ease,box-shadow .18s}
+        :root{--bg-1:#071225;--bg-2:#061028;--neon-a:#00ffd5;--neon-b:#6b8cff}
+        html,body{height:100%;margin:0;font-family:Inter,Montserrat,system-ui; color:#e8fbff;background:linear-gradient(180deg,var(--bg-1),var(--bg-2));-webkit-font-smoothing:antialiased}
+        body::after{content:'';position:fixed;inset:0;background-image:radial-gradient(rgba(255,255,255,0.02) 1px, transparent 1px);background-size:90px 90px;opacity:0.45;mix-blend-mode:overlay;pointer-events:none}
+        .wrap{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:48px}
+        .container{width:clamp(320px,420px,520px);padding:28px;border-radius:14px;background:linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01));border:1px solid rgba(255,255,255,0.02);box-shadow:0 30px 80px rgba(0,0,0,0.7);position:relative;overflow:visible;transform-style:preserve-3d}
+        .container::before{content:'';position:absolute;right:-30px;top:-30px;width:240px;height:240px;background-image:url('/static/logo.png');background-size:contain;background-repeat:no-repeat;opacity:0.06;filter:brightness(2);pointer-events:none}
+        h1{margin:0 0 6px;color:var(--neon-a);font-size:1.8rem;font-weight:900;text-shadow:0 4px 30px rgba(0,255,213,0.08)}
+        h2{margin:0 0 14px;color:#bfeeff;font-weight:600;font-size:0.95rem}
+        label{display:block;font-weight:600;color:#cfeeff;margin-top:10px}
+        input[type=text],input[type=password]{width:100%;padding:12px;border-radius:10px;border:1px solid rgba(255,255,255,0.04);margin-top:8px;background:rgba(255,255,255,0.01);color:#e8fbff}
+    .btn{position:relative;margin-top:16px;width:100%;padding:12px;border-radius:12px;border:0;font-weight:800;cursor:pointer;background:linear-gradient(90deg,var(--neon-b),var(--neon-a));color:#011;overflow:hidden;box-shadow:0 10px 40px rgba(107,140,255,0.06),0 0 30px rgba(0,255,213,0.06);transition:transform .18s ease,box-shadow .18s}
     .btn::after{content:'';position:absolute;left:-60%;top:0;width:60%;height:100%;background:linear-gradient(120deg, rgba(255,255,255,0.12), rgba(255,255,255,0.02), transparent);transform:skewX(-18deg);transition:left .6s ease}
     .btn:hover{transform:translateY(-6px);box-shadow:0 22px 88px rgba(2,6,23,0.7),0 0 48px rgba(107,140,255,0.12)}
     .btn:hover::after{left:120%}
     .btn .ripple{position:absolute;border-radius:50%;transform:scale(0);pointer-events:none;opacity:0.9;background:rgba(255,255,255,0.14);animation:ripple 650ms cubic-bezier(.2,.7,.2,1)}
     @keyframes ripple{to{transform:scale(8);opacity:0}}
-        .logout{float:right}
-        .cols{display:flex;gap:20px;flex-wrap:wrap}
-        .col{flex:1;min-width:280px}
-    .panel{background:linear-gradient(180deg, rgba(255,255,255,0.01), rgba(255,255,255,0.005));padding:12px;border-radius:12px;box-shadow:0 10px 40px rgba(0,0,0,0.6);border:1px solid rgba(255,255,255,0.02)}
-    /* ensure text is readable inside white boxes */
-    .white-box{color:#0b2b3a}
-    .video-stack{position:relative;width:100%;height:520px;max-height:820px;overflow:hidden}
-    .video-stack img{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;border-radius:6px;transition:opacity .18s ease;display:block}
-        .right-tilt{transform-style:preserve-3d;transition:transform .12s ease}
-        #video-preview{background:#000;border-radius:8px;border:1px solid rgba(255,255,255,0.02);}
+        .error{color:#ff7b9c;text-align:center;margin-top:8px}
+        #bg-canvas{position:fixed;left:0;top:0;right:0;bottom:0;z-index:-1;mix-blend-mode:screen}
     </style>
 </head>
 <body>
-    <div class="container">
-        <h1>Admin Dashboard</h1>
-        <h2>Welcome, {{ user }} | <a href="/logout" class="btn logout">Logout</a></h2>
-        <div style="text-align:center;">
-            <a href="/" class="btn">Home</a>
-            <a href="/attendance" class="btn">View Attendance (Admin)</a>
-            <a href="/download" class="btn">Download Excel</a>
+    <canvas id="bg-canvas" aria-hidden="true"></canvas>
+    <div class="wrap">
+        <div class="container" id="login-card">
+            <h1>Login to attmanege</h1>
+            <h2>attmanege — Raajdhani Engineering College, Bhubaneswar</h2>
+            
+            <form method="post">
+                <input type="hidden" name="csrf_token" value="s7-Nl6NGczC15JpmA2W52w">
+                <label for="username">Username</label>
+                <input type="text" id="username" name="username" required>
+                <label for="password">Password</label>
+                <input type="password" id="password" name="password" required>
+                <button class="btn" type="submit">Login</button>
+            </form>
         </div>
-        <div id="admin-content" style="margin-top:32px;">
-            <div style="display:flex;gap:20px;flex-wrap:wrap;">
-                <div style="flex:1; min-width:280px;">
-                    <h3>Pending Student Approvals</h3>
-                    <div id="pending-list" style="margin-bottom:16px; display:flex;flex-direction:column;gap:8px;">
-                        <!-- populated by JS -->
-                    </div>
-
-                    <h3 style="margin-top:24px;">Manage Admins</h3>
-                    <form id="add-admin-form" method="post" action="/admin/add_admin" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
-                        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-                        <input name="username" placeholder="username" required>
-                        <input name="password" placeholder="password" required type="password">
-                        <button class="btn" type="submit">Add Admin</button>
-                        <button id="reload-admins-btn" type="button" class="btn" style="background:linear-gradient(90deg,#ffb347,#ffcc33);">Reload Admins</button>
-                    </form>
-                    <div style="margin-top:8px;" id="admins-list">
-                        <!-- current admins inserted by server-side for initial render -->
-                        {% for a, h in USERS.items() %}
-                            <div style="background:#f7fafd;padding:8px;border-radius:8px;margin:6px 0;display:flex;justify-content:space-between;align-items:center;color:#0b2b3a;">
-                                <span style="color:#0b2b3a">{{ a }}</span>
-                                {% if a != user %}
-                                    <form method="post" action="/admin/delete_admin/{{ a }}">
-                                        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-                                        <button class="btn" type="submit">Delete</button>
-                                    </form>
-                                {% endif %}
-                            </div>
-                        {% endfor %}
-                    </div>
-                </div>
+    </div>
+    <script>
+        // neon particles
+        const canvas = document.getElementById('bg-canvas'); const ctx = canvas.getContext('2d'); let w=canvas.width=innerWidth,h=canvas.height=innerHeight; window.addEventListener('resize', ()=>{ w=canvas.width=innerWidth; h=canvas.height=innerHeight; });
+        const pts=[]; for(let i=0;i<140;i++) pts.push({x:Math.random()*w,y:Math.random()*h,vx:(Math.random()-0.5)*1.2,vy:(Math.random()-0.5)*1.2,r:Math.random()*2.5+0.6,h:160+Math.random()*140});
+        function step(){ ctx.clearRect(0,0,w,h); for(const p of pts){ p.x+=p.vx; p.y+=p.vy; if(p.x<-40) p.x=w+40; if(p.x>w+40) p.x=-40; if(p.y<-40) p.y=h+40; if(p.y>h+40) p.y=-40; const g=ctx.createRadialGradient(p.x,p.y,0,p.x,p.y,p.r*6); g.addColorStop(0,`hsla(${p.h},90%,60%,0.22)`); g.addColorStop(0.6,`hsla(${p.h},80%,50%,0.08)`); g.addColorStop(1,'transparent'); ctx.fillStyle=g; ctx.fillRect(p.x-p.r*6,p.y-p.r*6,p.r*12,p.r*12);} requestAnimationFrame(step);} step();
+        // tilt effect
+        const card = document.getElementById('login-card'); if(card){ card.addEventListener('mousemove', (e)=>{ const r=card.getBoundingClientRect(); const cx=r.left+r.width/2, cy=r.top+r.height/2; const dx=e.clientX-cx, dy=e.clientY-cy; const rx=(-dy/r.height)*10, ry=(dx/r.width)*10; card.style.transform = `perspective(900px) rotateX(${rx}deg) rotateY(${ry}deg)`; }); card.addEventListener('mouseleave', ()=>card.style.transform='none'); }
+        // ripple handler
+        document.addEventListener('click', function(e){ const btn = e.target.closest('.btn'); if(!btn) return; const r = document.createElement('span'); r.className='ripple'; const rect = btn.getBoundingClientRect(); const size = Math.max(rect.width, rect.height); r.style.width = r.style.height = size+'px'; const x = e.clientX - rect.left - size/2; const y = e.clientY - rect.top - size/2; r.style.left = x+'px'; r.style.top = y+'px'; btn.appendChild(r); setTimeout(()=> r.remove(), 700); });
+    </script>
+</body>
+</html>
