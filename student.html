@@ -3,77 +3,185 @@
 <head>
     <meta charset="UTF-8">
     <title>Student Dashboard | attmanege</title>
-    <link href="https://fonts.googleapis.com/css?family=Montserrat:700,900&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@700;900&family=Inter:wght@400;600&display=swap" rel="stylesheet">
     <style>
-        :root{--accent1:#6dd5ed;--accent2:#2193b0}
-        html,body{height:100%;margin:0;font-family:Montserrat,system-ui}
-        body{display:flex;align-items:center;justify-content:center;background:linear-gradient(180deg,var(--accent1),var(--accent2));padding:28px}
-        .container{width:clamp(360px,780px,980px);background:linear-gradient(180deg,rgba(255,255,255,0.96),rgba(255,255,255,0.9));padding:22px;border-radius:16px;box-shadow:0 20px 60px rgba(4,22,30,0.28);position:relative}
-        .container::before{content:'';position:absolute;right:-60px;top:-60px;width:420px;height:420px;background-image:url('/static/logo.png');background-size:contain;background-repeat:no-repeat;opacity:0.06}
-        h1{margin:0;color:var(--accent2);font-weight:900;font-size:1.6rem}
-        .grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px}
-        .stat{background:rgba(255,255,255,0.86);padding:14px;border-radius:10px;box-shadow:0 8px 24px rgba(8,30,40,0.06)}
-        .big{font-size:2rem;font-weight:900;color:#0b3a47}
-        .btn{display:inline-block;padding:10px 14px;border-radius:10px;border:0;background:linear-gradient(90deg,var(--accent1),var(--accent2));color:#fff;font-weight:800;cursor:pointer}
+        :root{--bg-1:#071225;--bg-2:#061028;--neon-a:#00ffd5;--neon-b:#6b8cff}
+        html,body{height:100%;margin:0;font-family:Inter,Montserrat,system-ui;background:linear-gradient(180deg,var(--bg-1),var(--bg-2));color:#e8fbff}
+        /* Full-bleed container: occupy full viewport width while keeping inner padding */
+        .container{width:100%;max-width:none;margin:0;padding:28px 48px;border-radius:0 0 18px 18px;background:linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01));box-shadow:0 40px 100px rgba(0,0,0,0.7);position:relative;overflow:visible}
+        .container::after{content:'';position:absolute;right:24px;top:12px;width:420px;height:420px;background-image:url('/static/logo.png');background-size:contain;background-repeat:no-repeat;opacity:0.03;transform:rotate(-12deg);pointer-events:none}
+        h1{font-size:1.6rem;margin:0;color:var(--neon-b);font-weight:900}
+        .btn{position:relative;display:inline-flex;align-items:center;gap:10px;padding:8px 12px;border-radius:10px;border:0;font-weight:800;cursor:pointer;background:linear-gradient(90deg,var(--neon-b),var(--neon-a));color:#022;overflow:hidden}
+        .btn::after{content:'';position:absolute;left:-60%;top:0;width:60%;height:100%;background:linear-gradient(120deg, rgba(255,255,255,0.12), rgba(255,255,255,0.02), transparent);transform:skewX(-18deg);transition:left .6s ease}
+        .btn:hover::after{left:120%}
+        .btn .ripple{position:absolute;border-radius:50%;transform:scale(0);pointer-events:none;opacity:0.9;background:rgba(255,255,255,0.14);animation:ripple 650ms cubic-bezier(.2,.7,.2,1)}
+        @keyframes ripple{to{transform:scale(8);opacity:0}}
+        .top-actions{display:flex;gap:12px;justify-content:flex-end}
+        .panel{background:linear-gradient(180deg, rgba(255,255,255,0.01), rgba(255,255,255,0.005));padding:14px;border-radius:12px;box-shadow:0 10px 40px rgba(0,0,0,0.6);border:1px solid rgba(255,255,255,0.02)}
+        #chart-attendance{width:100%;height:360px;max-height:640px}
+        #recent-images img{width:140px;height:90px;object-fit:cover;border-radius:6px}
+        /* Responsive tweaks */
+        @media (max-width: 900px){ .container{width:calc(100% - 32px);margin:18px} #chart-attendance{height:300px} #student-stats{width:100%;display:flex;flex-wrap:wrap;gap:8px} #student-stats > div{flex:1 1 45%;min-width:120px} #recent-images img{width:110px;height:72px} }
+        @media (max-width: 540px){ #chart-attendance{height:240px} .top-actions{display:none} #student-stats > div{flex:1 1 100%} #recent-images img{width:88px;height:60px} }
+        @media (max-width: 360px){ #chart-attendance{height:200px} #recent-images img{width:72px;height:52px} }
+        /* modal */
+        .modal-backdrop{position:fixed;left:0;top:0;width:100%;height:100%;background:rgba(0,0,0,0.6);display:none;align-items:center;justify-content:center;z-index:9999}
+        .modal{background:#071224;padding:18px;border-radius:12px;max-width:900px;width:calc(100% - 48px);box-shadow:0 30px 80px rgba(0,0,0,0.8);border:1px solid rgba(255,255,255,0.03)}
+        .modal .grid{display:flex;gap:12px;align-items:flex-start}
+        .modal img{max-width:320px;width:100%;height:auto;border-radius:8px}
+        .modal .meta{color:#cfeeff}
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>Welcome, {{ student.name if student else student.enroll }}</h1>
-        <div class="grid">
-            <div class="stat">
-                <h4>Attendance</h4>
-                <div class="big">{{ stats.percentage if stats.percentage is not none else 'N/A' }}%</div>
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px">
+            <div>
+                <h1>Student Dashboard</h1>
+                <div style="margin-top:6px;color:#cfeeff">Welcome, <strong style="color:#fff">{{ student.name if student else student.enroll }}</strong></div>
             </div>
-            <div class="stat">
-                <h4>Score</h4>
-                <div class="big">{{ stats.score if stats.score is not none else 'N/A' }} / 10</div>
-            </div>
-            <div class="stat">
-                <h4>Rank</h4>
-                <div class="big">{{ rank if rank is not none else 'Unranked' }}</div>
-                <small>Streak: <strong>{{ streak }}</strong></small>
-            </div>
-            <div class="stat">
-                <h4>Update Photos</h4>
-                <form method="post" action="/student_reupload" enctype="multipart/form-data">
-                    <input type="hidden" name="enroll" value="{{ student.enroll }}">
-                    <input type="file" name="photos" accept="image/*" multiple required>
-                    <div style="margin-top:8px;"><button class="btn" type="submit">Upload & Update</button></div>
-                </form>
-                <div style="margin-top:8px;"><a class="btn" href="/forgot_password">Forgot/Reset</a></div>
+            <div class="top-actions">
+                <a class="btn" href="/">Home</a>
+                <a class="btn" href="/logout">Logout</a>
             </div>
         </div>
-        <div style="margin-top:14px;display:grid;grid-template-columns:1fr 1fr;gap:12px;" class="stat">
-            <div style="padding:14px;border-radius:10px;background:rgba(255,255,255,0.86)">
-                <h4>Attendance Over Time</h4>
-                <canvas id="chart-attendance" style="width:100%;height:200px"></canvas>
+
+        <div style="margin-top:18px;display:flex;gap:18px;flex-wrap:wrap;align-items:stretch">
+            <div style="flex:1;min-width:320px;" class="panel">
+                <h3 style="margin:0 0 8px 0;color:#dfefff">Attendance Overview</h3>
+                <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+                    <div style="flex:1">
+                        <canvas id="chart-attendance"></canvas>
+                    </div>
+                    <div id="student-stats" style="width:220px;display:flex;flex-direction:column;gap:10px"></div>
+                </div>
+                <div id="recent-images" style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap"></div>
             </div>
-            <div style="padding:14px;border-radius:10px;background:rgba(255,255,255,0.86)">
-                <h4>Statistics</h4>
-                <div id="student-stats" style="margin-top:8px">Loading stats...</div>
+
+            <div style="width:300px;min-width:260px;" class="panel">
+                <h3 style="margin-top:0">Profile</h3>
+                <div style="margin-top:6px;"><strong>Name:</strong> {{ student.name if student else 'N/A' }}</div>
+                <div style="margin-top:6px;"><strong>Enroll:</strong> {{ student.enroll }}</div>
+                <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">
+                    <form method="post" action="/student_reupload" enctype="multipart/form-data">
+                        <input type="hidden" name="enroll" value="{{ student.enroll }}">
+                        <input type="file" name="photos" accept="image/*" multiple required>
+                        <div style="margin-top:8px;"><button class="btn" type="submit">Upload Photos</button></div>
+                    </form>
+                </div>
+                <div style="margin-top:12px;color:#cfeeff">Last seen: <strong style="color:#fff">{{ stats.last_seen if stats and stats.last_seen else 'Never' }}</strong></div>
             </div>
         </div>
-        <!-- Chart.js CDN for lightweight charts -->
+
+        <!-- Chart.js CDN -->
         <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <!-- Chart.js zoom plugin (lightweight optional) -->
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@1.2.1/dist/chartjs-plugin-zoom.min.js"></script>
         <script>
             async function loadStudentCharts(){
-                // placeholder: fetch simple attendance timeseries from attendance API or synthesize from Summary
                 try{
-                    // For now synthesize a small dataset
-                    const labels = ['Week 1','Week 2','Week 3','Week 4','Week 5'];
-                    const data = [80,85,78,90,88];
+                    const enroll = '{{ student.enroll }}';
+                    const resp = await fetch('/api/student_history/' + encodeURIComponent(enroll));
+                    const j = await resp.json();
+                    if(!j.ok){ throw new Error(j.error || 'failed'); }
+                    const d = j.data;
+
+                    function formatSessionLabel(raw, idx, total){
+                        if(raw === null || raw === undefined) return '';
+                        if(typeof raw === 'number'){
+                            const maybe = raw > 1e12 ? new Date(raw) : new Date(raw*1000);
+                            if(!isNaN(maybe.getTime())){
+                                if(total <= 12) return maybe.toLocaleString(undefined, {month:'short', day:'numeric', hour:'2-digit', minute:'2-digit'});
+                                return maybe.toLocaleDateString(undefined, {month:'short', day:'numeric'});
+                            }
+                        }
+                        let s = String(raw).trim(); if(!s) return '';
+                        let m = s.match(/attendance[_-]?(\d{4})(\d{2})(\d{2})[_-]?(\d{2})(\d{2})(\d{2})?/i);
+                        if(m){ const y=m[1],mo=m[2],dd=m[3],hh=m[4]||'00',mm=m[5]||'00',ss=m[6]||'00'; const dt=new Date(`${y}-${mo}-${dd}T${hh}:${mm}:${ss}`); if(!isNaN(dt.getTime())){ if(total<=12) return dt.toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}); return dt.toLocaleDateString(undefined,{month:'short',day:'numeric'}); } }
+                        m = s.match(/^(\d{4})(\d{2})(\d{2})(?:[_-]?(\d{2})(\d{2})(\d{2}))?$/);
+                        if(m){ const y=m[1],mo=m[2],dd=m[3],hh=m[4]||'00',mm=m[5]||'00',ss=m[6]||'00'; const dt=new Date(`${y}-${mo}-${dd}T${hh}:${mm}:${ss}`); if(!isNaN(dt.getTime())){ if(total<=12) return dt.toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}); return dt.toLocaleDateString(undefined,{month:'short',day:'numeric'}); } }
+                        const iso = new Date(s); if(!isNaN(iso.getTime())){ if(total<=12) return iso.toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}); return iso.toLocaleDateString(undefined,{month:'short',day:'numeric'}); }
+                        if(s.length > 16 && (s.includes(' ')||s.includes('T'))) return s.slice(0,16) + '\u2026'; if(s.length > 12) return s.slice(0,12) + '\u2026'; return s;
+                    }
+
+                    const total = d.sessions ? d.sessions.length : 0;
+                    const labels = (d.sessions || []).map((s,i) => formatSessionLabel(s.date, i, total));
+                    const data = (d.sessions || []).map(s => s.present ? 100 : 0);
                     const ctx = document.getElementById('chart-attendance').getContext('2d');
-                    new Chart(ctx, {type:'line',data:{labels:labels,datasets:[{label:'% attendance',data:data,fill:true,backgroundColor:'rgba(107,140,255,0.12)',borderColor:'rgba(107,140,255,0.9)',tension:0.3}]},options:{scales:{y:{beginAtZero:true,max:100}}}});
-                    document.getElementById('student-stats').innerHTML = `<div>Present: <strong>{{ stats.raw.present_count or 'N/A' }}</strong></div><div>Total Sessions: <strong>{{ stats.raw.sessions or 'N/A' }}</strong></div><div>Streak: <strong>{{ streak }}</strong></div>`;
-                }catch(e){ console.error(e); document.getElementById('student-stats').innerText='Failed to load charts'; }
+                    if(window._studentChart){ try{ window._studentChart.destroy(); }catch(e){} }
+                    const approxTickLimit = Math.max(3, Math.floor(window.innerWidth / 140));
+                    window._studentChart = new Chart(ctx, {
+                        type: 'bar',
+                        data: { labels: labels, datasets: [{ label: '% presence (100/0)', data: data, backgroundColor: data.map(v=> v===100? 'rgba(76,175,80,0.9)': 'rgba(220,53,69,0.9)'), borderColor: data.map(v=> v===100? 'rgba(76,175,80,1)': 'rgba(220,53,69,1)'), borderWidth: 1 }] },
+                        options: { responsive: true, maintainAspectRatio: false, scales: { x: { ticks: { autoSkip: true, maxRotation: 45, minRotation: 0, maxTicksLimit: approxTickLimit }, grid: { display: false } }, y: { beginAtZero: true, max: 100, ticks: { stepSize: 20 } } }, plugins: { legend: { display: false }, zoom: { pan: { enabled: true, mode: 'x' }, zoom: { wheel: { enabled: true }, pinch: { enabled: true }, mode: 'x' } } }, onClick: (evt, activeEls) => { if(!activeEls.length) return; const idx = activeEls[0].index; openSessionModal(d.sessions[idx]); } }
+                    });
+
+                    // stats cards
+                    const statsEl = document.getElementById('student-stats'); statsEl.innerHTML = '';
+                    const items = [ ['Total sessions', d.total_sessions || 0], ['Present', d.present_count || 0], ['Percentage', d.percentage !== null ? (d.percentage + '%') : 'N/A'], ['Streak', d.streak || 0], ['Last seen', d.last_seen || 'Never'] ];
+                    for(const it of items){ const el = document.createElement('div'); el.style.padding='10px'; el.style.background='#f6fbff'; el.style.color='#04323a'; el.style.borderRadius='8px'; el.style.marginBottom='6px'; el.innerHTML = `<div style="font-weight:800;font-size:18px">${it[1]}</div><div style="font-size:12px;opacity:0.9">${it[0]}</div>`; statsEl.appendChild(el); }
+
+                    // recent images (clickable)
+                    const ri = document.getElementById('recent-images'); ri.innerHTML=''; const images = d.recent_images || [];
+                    if(images.length){ for(const img of images){ const im = document.createElement('img'); im.src = img; im.style.cursor='pointer'; im.addEventListener('click', ()=> openImageModal(img)); ri.appendChild(im); } } else { ri.innerHTML = '<div style="color:#cfeeff">No recent images available</div>'; }
+
+                    // create modal container if missing
+                    if(!document.getElementById('modal-backdrop')){
+                        const mb = document.createElement('div'); mb.id='modal-backdrop'; mb.className='modal-backdrop'; mb.innerHTML = `<div class='modal'><div style='display:flex;justify-content:space-between;align-items:center'><div style='font-weight:900;color:#fff'>Session details</div><button id='modal-close' class='btn'>Close</button></div><div id='modal-body' style='margin-top:12px'></div></div>`; document.body.appendChild(mb);
+                        mb.addEventListener('click', (ev)=>{ if(ev.target === mb || ev.target.id==='modal-close') mb.style.display='none'; });
+                    }
+
+                    function openImageModal(src){ const mb = document.getElementById('modal-backdrop'); const body = document.getElementById('modal-body'); body.innerHTML = `<div class='grid'><img src='${src}' alt='image'/><div class='meta'>Preview</div></div>`; mb.style.display='flex'; }
+
+                    function openSessionModal(session){ const mb = document.getElementById('modal-backdrop'); const body = document.getElementById('modal-body'); const imgs = (session.images || []).map(u=>`<img src='${u}' style='max-width:140px;margin-right:8px;border-radius:6px'/>`).join('') || '<div style="color:#cfeeff">No session images</div>'; body.innerHTML = `<div style='display:flex;flex-direction:column;gap:12px'><div style='font-weight:800;color:#fff'>${session.date}</div><div style='color:#cfeeff'>Present: ${session.present? 'Yes' : 'No'}</div><div style='display:flex;gap:8px;flex-wrap:wrap'>${imgs}</div></div>`; mb.style.display='flex'; }
+
+                }catch(e){ console.error(e); const el = document.getElementById('student-stats'); if(el) el.innerText='Failed to load student data'; }
             }
             loadStudentCharts();
         </script>
-        <div style="display:flex;gap:12px;justify-content:center;margin-top:18px">
-            <a class="btn" href="/">Home</a>
-            <a class="btn" href="/logout">Logout</a>
-        </div>
+
+        <!-- neon particle background (copied from admin panel, adapted) -->
+        <script>
+            (function(){
+                const canvas = document.createElement('canvas');
+                canvas.id = 'bg-canvas';
+                // style so canvas is fixed behind content and not interactive
+                canvas.style.position = 'fixed';
+                canvas.style.left = '0';
+                canvas.style.top = '0';
+                canvas.style.width = '100%';
+                canvas.style.height = '100%';
+                canvas.style.zIndex = '-1';
+                canvas.style.pointerEvents = 'none';
+                document.body.appendChild(canvas);
+                const ctx = canvas.getContext('2d');
+                let w = canvas.width = innerWidth, h = canvas.height = innerHeight;
+                window.addEventListener('resize', ()=>{ w = canvas.width = innerWidth; h = canvas.height = innerHeight; });
+                const pts = [];
+                for(let i=0;i<140;i++) pts.push({x:Math.random()*w,y:Math.random()*h,vx:(Math.random()-0.5)*1.2,vy:(Math.random()-0.5)*1.2,r:Math.random()*2.8+0.6,h:160+Math.random()*140});
+                function step(){
+                    ctx.clearRect(0,0,w,h);
+                    for(const p of pts){
+                        p.x += p.vx; p.y += p.vy;
+                        if(p.x < -40) p.x = w + 40; if(p.x > w + 40) p.x = -40;
+                        if(p.y < -40) p.y = h + 40; if(p.y > h + 40) p.y = -40;
+                        const g = ctx.createRadialGradient(p.x,p.y,0,p.x,p.y,p.r*6);
+                        g.addColorStop(0, `hsla(${p.h},90%,60%,0.22)`);
+                        g.addColorStop(0.6, `hsla(${p.h},80%,50%,0.08)`);
+                        g.addColorStop(1, 'transparent');
+                        ctx.fillStyle = g;
+                        ctx.fillRect(p.x-p.r*6, p.y-p.r*6, p.r*12, p.r*12);
+                    }
+                    requestAnimationFrame(step);
+                }
+                step();
+            })();
+        </script>
+
+        <!-- ripple handler -->
+        <script>
+            document.addEventListener('click', function(e){ const btn = e.target.closest('.btn'); if(!btn) return; const r = document.createElement('span'); r.className='ripple'; const rect = btn.getBoundingClientRect(); const size = Math.max(rect.width, rect.height); r.style.width = r.style.height = size+'px'; const x = e.clientX - rect.left - size/2; const y = e.clientY - rect.top - size/2; r.style.left = x+'px'; r.style.top = y+'px'; btn.appendChild(r); setTimeout(()=> r.remove(), 700); });
+        </script>
+
     </div>
 </body>
 </html>
