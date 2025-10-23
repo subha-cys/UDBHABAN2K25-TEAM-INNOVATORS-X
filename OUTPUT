@@ -7,11 +7,11 @@ import pickle
 import io
 import sys
 import numpy as np
+import sqlite3
 from werkzeug.utils import secure_filename
 from werkzeug.security import generate_password_hash, check_password_hash
 import shutil
 import face_recognition
-
 try:
     from deploy.recognizer import Recognizer
 except Exception:
@@ -27,14 +27,24 @@ app = Flask(__name__)
 app.secret_key = 'attmanege-secret-key'  # Change for production
 
 import secrets
+import logging
+
+# ensure data dir and logging
+DATA_DIR = os.path.join(os.path.dirname(__file__), '..', 'data')
+os.makedirs(DATA_DIR, exist_ok=True)
+LOG_PATH = os.path.join(DATA_DIR, 'server_errors.log')
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s %(levelname)s %(message)s',
+                    handlers=[logging.FileHandler(LOG_PATH, encoding='utf-8'), logging.StreamHandler()])
+
 
 KNOWN_DIR = os.path.join(os.path.dirname(__file__), '..', 'data', 'known')
 ENCODINGS_DB = os.path.join(os.path.dirname(__file__), '..', 'data', 'encodings_db.pkl')
-
+# ...existing code...
 
 @app.route('/register', methods=['GET', 'POST'])
 def register():
-  
+    # Only admin may register students
     if not session.get('user'):
         return redirect(url_for('login'))
     error = None
@@ -57,6 +67,7 @@ def register():
             for i, f in enumerate(files):
                 fname = f"{i+1}_{secure_filename(f.filename)}"
                 f.save(os.path.join(student_dir, fname))
+            # Generate encodings
             encodings = []
             for imgfile in os.listdir(student_dir):
                 imgpath = os.path.join(student_dir, imgfile)
@@ -67,7 +78,7 @@ def register():
                         encodings.append(faces[0])
                 except Exception:
                     continue
-           
+            # Update DB
             db = {}
             import pickle
             if os.path.exists(ENCODINGS_DB):
@@ -87,7 +98,7 @@ def register():
             except Exception:
                 pass
             success = f"Student {name} ({enroll}) registered successfully! {len(encodings)} faces encoded."
-       
+            # create student account (pending approval) - store hashed password
             students = load_students()
             students[f"{enroll}"] = {
                 'name': name,
@@ -102,6 +113,125 @@ def register():
 COLLEGE_NAME = "Raajdhani Engineering College"
 SITE_TITLE = "attmanege"
 EXCEL_PATH = os.path.join(os.path.dirname(__file__), '..', 'data', 'attendance.xlsx')
+
+# Default schedule configuration: 6 classes per day, each 1 hour long.
+# By default classes start at these hours (24h): 8:00,9:00,10:00,11:00,12:00,13:00
+# You may override by creating data/config.json with keys:
+# { "class_starts": [8,9,10,11,12,13], "classes_per_day": 6, "sample_interval_minutes": 15, "required_samples": 3 }
+CONFIG_JSON = os.path.join(os.path.dirname(__file__), '..', 'data', 'config.json')
+
+def get_schedule_config():
+    cfg = {'class_starts': [8,9,10,11,12,13], 'classes_per_day': 6, 'sample_interval_minutes': 15, 'required_samples': 3}
+    try:
+        import json
+        if os.path.exists(CONFIG_JSON):
+            with open(CONFIG_JSON, 'r', encoding='utf-8') as f:
+                user = json.load(f)
+            # merge
+            cfg.update({k: user[k] for k in ('class_starts','classes_per_day','sample_interval_minutes','required_samples') if k in user})
+    except Exception:
+        pass
+    return cfg
+
+def _parse_when_ts(when_ts):
+    """Robustly parse a stored timestamp value (could be int seconds, ISO string, or filename-like).
+    Returns a timezone-naive datetime in local time when possible.
+    """
+    import datetime, re
+    if when_ts is None:
+        return None
+    # if numeric (int/float string) treat as unix seconds
+    try:
+        if isinstance(when_ts, (int, float)):
+            return datetime.datetime.fromtimestamp(int(when_ts))
+        s = str(when_ts).strip()
+        if s.isdigit() and len(s) >= 10:
+            # seconds or milliseconds
+            if len(s) > 10:
+                return datetime.datetime.fromtimestamp(int(s)/1000)
+            return datetime.datetime.fromtimestamp(int(s))
+        # common filename formats: attendance_YYYYMMDD_HHMMSS or YYYYMMDD_HHMMSS
+        m = re.search(r'(\d{4})(\d{2})(\d{2})[_-]?(\d{2})(\d{2})(\d{2})', s)
+        if m:
+            y,mo,d,hh,mm,ss = m.groups()
+            return datetime.datetime(int(y), int(mo), int(d), int(hh), int(mm), int(ss))
+        # ISO-like
+        try:
+            return datetime.datetime.fromisoformat(s)
+        except Exception:
+            pass
+        # fallback: try parsing common formats
+        for fmt in ('%Y-%m-%d %H:%M:%S','%Y-%m-%d','%d/%m/%Y %H:%M:%S','%d/%m/%Y'):
+            try:
+                return datetime.datetime.strptime(s, fmt)
+            except Exception:
+                continue
+    except Exception:
+        return None
+    return None
+
+def aggregate_db_records_into_classes(rows, schedule=None):
+    """
+    rows: iterable of tuples like (when_ts, name, image_path) or dicts containing 'when_ts' etc.
+    Returns: dict mapping (date_str, class_index) -> { 'count_slots': int, 'slots': set(), 'images': [..], 'present': bool }
+    Uses schedule to map timestamps to class slots (15-min intervals). A class is present if number of distinct slots >= required_samples.
+    """
+    import collections
+    import datetime
+    if schedule is None:
+        schedule = get_schedule_config()
+    class_starts = schedule.get('class_starts', [8,9,10,11,12,13])
+    sample_m = int(schedule.get('sample_interval_minutes', 15))
+    required = int(schedule.get('required_samples', 3))
+
+    grouped = {}  # key=(date_str, class_idx) -> {'slots': set(), 'images': []}
+    for r in rows:
+        try:
+            # support both tuple and dict rows
+            if isinstance(r, (list, tuple)):
+                when_ts = r[0]
+                image_path = r[2] if len(r) > 2 else None
+            elif isinstance(r, dict):
+                when_ts = r.get('when_ts') or r.get('when') or r.get('timestamp')
+                image_path = r.get('image_path') or r.get('image')
+            else:
+                continue
+            dt = _parse_when_ts(when_ts)
+            if not dt:
+                continue
+            date_str = dt.date().isoformat()
+            # find which class this timestamp belongs to (by hour)
+            hh = dt.hour
+            mm = dt.minute
+            class_idx = None
+            for i, start_h in enumerate(class_starts):
+                if hh >= start_h and hh < start_h + 1:
+                    class_idx = i
+                    break
+            if class_idx is None:
+                # not within class hours, skip
+                continue
+            # compute slot index within the class (0..(60/sample_m)-1)
+            slot = (mm // sample_m)
+            key = (date_str, class_idx)
+            ent = grouped.get(key)
+            if not ent:
+                ent = {'slots': set(), 'images': [], 'first_dt': dt}
+                grouped[key] = ent
+            ent['slots'].add(slot)
+            if image_path:
+                ent['images'].append(image_path)
+            # keep earliest dt for label
+            if dt < ent.get('first_dt', dt):
+                ent['first_dt'] = dt
+        except Exception:
+            continue
+    # finalize present boolean
+    out = {}
+    for k, v in grouped.items():
+        present = len(v['slots']) >= required
+        out[k] = {'slots_count': len(v['slots']), 'slots': sorted(list(v['slots'])), 'images': v['images'][:10], 'present': present, 'dt': v.get('first_dt')}
+    return out
 
 STUDENTS_JSON = os.path.join(os.path.dirname(__file__), '..', 'data', 'students.json')
 ADMINS_JSON = os.path.join(os.path.dirname(__file__), '..', 'data', 'admins.json')
@@ -151,6 +281,53 @@ def save_password_resets(d):
         json.dump(d, f, indent=2)
 
 
+def ensure_attendance_workbook():
+    """Ensure that EXCEL_PATH points to a valid .xlsx workbook with a 'Summary' sheet.
+    If missing, create a minimal workbook. If present but corrupted/unreadable, move it to a timestamped backup and create a new workbook.
+    """
+    try:
+        os.makedirs(os.path.dirname(EXCEL_PATH), exist_ok=True)
+        if not os.path.exists(EXCEL_PATH):
+            # create minimal workbook
+            from openpyxl import Workbook
+            wb = Workbook()
+            ws = wb.active
+            ws.title = 'Summary'
+            # default header
+            ws.append(['Name'])
+            wb.save(EXCEL_PATH)
+            return True
+        # try opening
+        try:
+            _wb = openpyxl.load_workbook(EXCEL_PATH)
+            # ensure Summary exists
+            if 'Summary' not in _wb.sheetnames:
+                _wb.create_sheet('Summary')
+                _wb.save(EXCEL_PATH)
+            return True
+        except Exception:
+            # backup corrupted file
+            try:
+                import time
+                bak = EXCEL_PATH + f'.corrupt.{int(time.time())}.bak'
+                os.replace(EXCEL_PATH, bak)
+            except Exception:
+                pass
+            # create a fresh workbook
+            try:
+                from openpyxl import Workbook
+                wb = Workbook()
+                ws = wb.active
+                ws.title = 'Summary'
+                ws.append(['Name'])
+                wb.save(EXCEL_PATH)
+                return True
+            except Exception:
+                return False
+    except Exception:
+        return False
+
+
 
 # Simple user store (demo) - will be populated from data/admins.json
 USERS = {}
@@ -189,10 +366,40 @@ def require_csrf():
             return False
     return True
 
+
+@app.errorhandler(Exception)
+def handle_uncaught_exception(err):
+    """Central fallback for unexpected server errors.
+    Logs a concise traceback and returns a friendly 500 response.
+    """
+    # If this is an HTTPException (404, 405, etc.) let Flask/Werkzeug handle it
+    try:
+        from werkzeug.exceptions import HTTPException
+        if isinstance(err, HTTPException):
+            return err
+    except Exception:
+        pass
+    try:
+        tb = ''.join(__import__('traceback').format_exception(type(err), err, err.__traceback__))
+    except Exception:
+        tb = str(err)
+    logging.error('Uncaught exception: %s', tb)
+    # If the client expects JSON, return JSON; otherwise render a minimal HTML page
+    if request.accept_mimetypes.accept_json and not request.accept_mimetypes.accept_html:
+        return jsonify({'error': 'internal-server-error'}), 500
+    # avoid leaking internals in HTML; provide a helpful message
+    return ("<h1>Internal Server Error</h1>"
+            "<p>The server encountered an unexpected error while processing your request." 
+            "Please check the server logs or contact the administrator.</p>"), 500
+
 @app.route('/')
 def home():
-    user = session.get('user')
-    return render_template('index.html', college=COLLEGE_NAME, site=SITE_TITLE, user=user)
+    # Render a simple selection/index page so users may choose Admin or Student flows
+    try:
+        return render_template('index.html', site=SITE_TITLE, college=COLLEGE_NAME)
+    except Exception:
+        # fallback to redirect to student login if template rendering fails for any reason
+        return redirect(url_for('student_login'))
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
@@ -221,15 +428,35 @@ def logout():
 
 @app.route('/student_login', methods=['GET', 'POST'])
 def student_login():
+    """Allow students to login with either their enrollment number or their name.
+    The form field is named 'enroll' for historic reasons; we accept a name string as well.
+    """
     error = None
     if request.method == 'POST':
-        enroll = request.form.get('enroll','').strip()
+        identifier = request.form.get('enroll','').strip()
         password = request.form.get('password','')
         students = load_students()
-        user = students.get(enroll)
         is_ajax = request.headers.get('X-Requested-With') == 'XMLHttpRequest' or request.is_json or 'application/json' in request.headers.get('Accept', '')
-        if user and user.get('approved') and check_password_hash(user.get('password',''), password):
-            session['student'] = enroll
+
+        # Try direct enroll lookup first
+        user = students.get(identifier)
+        resolved_enroll = None
+        if user:
+            resolved_enroll = identifier
+        else:
+            # attempt case-insensitive name lookup
+            try:
+                ident_lower = identifier.strip().lower()
+                for k, v in students.items():
+                    if (v.get('name') or '').strip().lower() == ident_lower:
+                        user = v
+                        resolved_enroll = str(v.get('enroll') or k)
+                        break
+            except Exception:
+                user = None
+
+        if user and resolved_enroll and user.get('approved') and check_password_hash(user.get('password',''), password):
+            session['student'] = resolved_enroll
             if is_ajax:
                 return jsonify({'ok': True, 'redirect': url_for('student_dashboard')})
             return redirect(url_for('student_dashboard'))
@@ -240,13 +467,18 @@ def student_login():
         else:
             if is_ajax:
                 return jsonify({'ok': False, 'error': 'Invalid credentials.'}), 401
-            error = 'Invalid credentials.'
+            error = 'Invalid credentials. Use your name or enrollment number as username and your enrollment number as password.'
     return render_template('student_login.html', error=error)
 
 
 def compute_student_attendance_and_score(enroll):
     # Very small logic: read Summary sheet, find row for enroll, compute percentage and score
-    wb = openpyxl.load_workbook(EXCEL_PATH, data_only=True)
+    # Ensure there is a valid workbook; if missing or corrupted, create a minimal one.
+    try:
+        ensure_attendance_workbook()
+        wb = openpyxl.load_workbook(EXCEL_PATH, data_only=True)
+    except Exception:
+        return {'percentage': None, 'score': None, 'streak': 0, 'raw': {}}
     sheet = wb['Summary']
     headers = [cell.value for cell in next(sheet.iter_rows(min_row=1, max_row=1))]
     rows = list(sheet.iter_rows(min_row=2, values_only=True))
@@ -325,6 +557,152 @@ def compute_student_attendance_and_score(enroll):
     return {'percentage': None, 'score': None, 'streak': 0, 'raw': {}}
 
 
+def extract_attendance_timeseries(enroll):
+    """Return a timeseries for the given enroll:
+    { 'enroll', 'name', 'sessions':[{'date':str, 'present':bool}], 'total_sessions', 'present_count', 'percentage', 'streak' }
+    Falls back to attendance.db when the Summary sheet is missing or unhelpful.
+    """
+    enroll = str(enroll)
+    students = load_students()
+    student = students.get(enroll) or {}
+    name = student.get('name') if student else None
+
+    # First try to read the Excel Summary sheet for session columns
+    sessions = []
+    try:
+        if ensure_attendance_workbook():
+            wb = openpyxl.load_workbook(EXCEL_PATH, data_only=True)
+            if 'Summary' in wb.sheetnames:
+                sheet = wb['Summary']
+                headers = [cell.value for cell in next(sheet.iter_rows(min_row=1, max_row=1))]
+                # detect enroll/name columns and session columns
+                enroll_col = None
+                name_col = None
+                session_cols = []
+                import re
+                date_re = re.compile(r"\d{4}-\d{1,2}-\d{1,2}|\d{1,2}/\d{1,2}/\d{2,4}")
+                for i, h in enumerate(headers):
+                    if not h:
+                        continue
+                    lh = str(h).strip().lower()
+                    if 'enroll' in lh or lh == 'id':
+                        enroll_col = i
+                    if 'name' in lh:
+                        name_col = i
+                    if h and date_re.search(str(h)):
+                        session_cols.append(i)
+                if not session_cols:
+                    # fallback: trailing columns after first 3 metadata columns
+                    if len(headers) > 4:
+                        session_cols = list(range(4, len(headers)))
+
+                # iterate rows and find the matching student row
+                for row in sheet.iter_rows(min_row=2, values_only=True):
+                    try:
+                        row_enroll = None
+                        if enroll_col is not None:
+                            row_enroll = row[enroll_col]
+                        row_name = None
+                        if name_col is not None:
+                            row_name = row[name_col]
+                        matched = False
+                        if row_enroll is not None and str(row_enroll).strip() == enroll:
+                            matched = True
+                        elif row_name is not None and name and str(row_name).strip().lower() == str(name).strip().lower():
+                            matched = True
+                        if not matched:
+                            continue
+                        # build session list
+                        present_count = 0
+                        total_sessions = 0
+                        for c in session_cols:
+                            total_sessions += 1
+                            v = row[c] if c < len(row) else None
+                            present = False
+                            if v is None:
+                                present = False
+                            elif isinstance(v, (int, float)):
+                                present = int(v) != 0
+                            else:
+                                s = str(v).strip().lower()
+                                present = s in ('1','p','present','y','yes','true')
+                            sessions.append({'date': str(headers[c]) if headers[c] is not None else str(c), 'present': bool(present)})
+                            if present:
+                                present_count += 1
+                        percentage = round((present_count / total_sessions) * 100, 2) if total_sessions else None
+                        # compute streak
+                        streak = 0
+                        for s in reversed(sessions):
+                            if s.get('present'):
+                                streak += 1
+                            else:
+                                break
+                        return {'enroll': enroll, 'name': name or row_name, 'sessions': sessions, 'total_sessions': total_sessions, 'present_count': present_count, 'percentage': percentage, 'streak': streak}
+                    except Exception:
+                        continue
+    except Exception:
+        pass
+
+    # Fallback: use attendance.db to construct recent per-day events
+    try:
+        dbp = os.path.join(os.path.dirname(__file__), '..', 'data', 'attendance.db')
+        if os.path.exists(dbp):
+            import sqlite3
+            conn = sqlite3.connect(dbp)
+            cur = conn.cursor()
+            # fetch attendance rows for this enroll ordered by id (chronological)
+            cur.execute("SELECT when_ts, name, image_path FROM attendance WHERE enroll=? ORDER BY id", (enroll,))
+            rows = cur.fetchall()
+            conn.close()
+            # aggregate rows into class sessions using schedule config (4 samples per class, 15-min intervals)
+            aggregated = aggregate_db_records_into_classes(rows)
+            # build sessions list sorted by date & class index
+            sessions = []
+            present_count = 0
+            ordered_keys = sorted(aggregated.keys(), key=lambda k: (k[0], k[1]))
+            for k in ordered_keys:
+                info = aggregated[k]
+                # use a readable label from dt if available
+                dt = info.get('dt')
+                label = dt.isoformat(sep=' ') if dt is not None else f"{k[0]}_class{int(k[1])}"
+                present = bool(info.get('present'))
+                sessions.append({'date': label, 'present': present, 'images': info.get('images', [])})
+                if present:
+                    present_count += 1
+            total_sessions = len(sessions)
+            percentage = round((present_count / total_sessions) * 100, 2) if total_sessions else None
+            streak = 0
+            for s in reversed(sessions):
+                if s.get('present'):
+                    streak += 1
+                else:
+                    break
+            # recent images: take up to 10 most recent images for this enroll
+            recent_images = []
+            try:
+                conn = sqlite3.connect(dbp)
+                cur = conn.cursor()
+                cur.execute('SELECT image_path FROM attendance WHERE enroll=? AND image_path IS NOT NULL ORDER BY id DESC LIMIT 10', (enroll,))
+                rows2 = cur.fetchall()
+                conn.close()
+                for r in rows2:
+                    p = r[0]
+                    if p and isinstance(p, str):
+                        if p.startswith('http://') or p.startswith('https://'):
+                            recent_images.append(p)
+                        else:
+                            recent_images.append(url_for('attendance_image_file', filename=os.path.basename(p)))
+            except Exception:
+                recent_images = []
+
+            return {'enroll': enroll, 'name': name, 'sessions': sessions, 'total_sessions': total_sessions, 'present_count': present_count, 'percentage': percentage, 'streak': streak, 'recent_images': recent_images}
+    except Exception:
+        pass
+
+    # last-resort empty structure
+    return {'enroll': enroll, 'name': name, 'sessions': [], 'total_sessions': 0, 'present_count': 0, 'percentage': None, 'streak': 0, 'recent_images': []}
+
+
 @app.route('/student_dashboard')
 def student_dashboard():
     enroll = session.get('student')
@@ -345,7 +723,12 @@ def student_dashboard():
 
 def compute_leaderboard_and_streaks(top_n=10):
     # Reads Summary sheet and returns sorted leaderboard by percentage and streaks
-    wb = openpyxl.load_workbook(EXCEL_PATH)
+    # Load workbook defensively: create a minimal workbook if missing/corrupted then load it
+    try:
+        ensure_attendance_workbook()
+        wb = openpyxl.load_workbook(EXCEL_PATH)
+    except Exception:
+        return [], {}
     sheet = wb['Summary']
     headers = [cell.value for cell in next(sheet.iter_rows(min_row=1, max_row=1))]
     rows = list(sheet.iter_rows(min_row=2, values_only=True))
@@ -363,6 +746,14 @@ def compute_leaderboard_and_streaks(top_n=10):
             present_col = i
         if h and 'total' in str(h).lower():
             total_col = i
+
+    # load students mapping once to allow name->enroll fallback when Excel lacks enroll column
+    try:
+        students_map = load_students()
+        # build lowercase name -> enroll mapping for quick lookup
+        name_to_enroll_map = { (v.get('name') or '').strip().lower(): str(v.get('enroll') or k) for k, v in students_map.items() }
+    except Exception:
+        name_to_enroll_map = {}
 
     leaderboard = []
     streaks = {}
@@ -387,7 +778,22 @@ def compute_leaderboard_and_streaks(top_n=10):
 
     for r in rows:
         try:
-            enroll = str(r[enroll_col]) if enroll_col is not None else None
+            # prefer enroll from the Excel column when present
+            enroll = None
+            if enroll_col is not None:
+                try:
+                    enroll_val = r[enroll_col]
+                    enroll = None if enroll_val is None else str(enroll_val)
+                except Exception:
+                    enroll = None
+            # fallback: try mapping by name using students.json
+            if (not enroll or enroll.strip() == '') and name_col is not None:
+                try:
+                    candidate_name = (r[name_col] or '').strip().lower()
+                    if candidate_name and candidate_name in name_to_enroll_map:
+                        enroll = name_to_enroll_map[candidate_name]
+                except Exception:
+                    pass
             name = r[name_col] if name_col is not None else enroll
             total = r[total_col] if total_col is not None else None
             present = r[present_col] if present_col is not None else None
@@ -426,6 +832,44 @@ def compute_leaderboard_and_streaks(top_n=10):
         except Exception:
             continue
     leaderboard.sort(key=lambda x: x['percentage'], reverse=True)
+    # If the Summary sheet contains no meaningful attendance data, fall back to sqlite attendance DB
+    if not leaderboard or all((not item.get('percentage') or item.get('percentage') == 0) for item in leaderboard):
+        try:
+            dbp = os.path.join(os.path.dirname(__file__), '..', 'data', 'attendance.db')
+            if os.path.exists(dbp):
+                import sqlite3
+                conn = sqlite3.connect(dbp)
+                cur = conn.cursor()
+                # fetch all rows with non-empty enroll to aggregate per-student
+                cur.execute("SELECT enroll, when_ts, name, image_path FROM attendance WHERE enroll IS NOT NULL AND trim(enroll) <> '' ORDER BY enroll, id")
+                rows2 = cur.fetchall()
+                conn.close()
+                # group rows by enroll
+                from collections import defaultdict
+                per_enroll = defaultdict(list)
+                for enroll_val, when_ts, name_val, img in rows2:
+                    per_enroll[str(enroll_val)].append((when_ts, name_val, img))
+                lb = []
+                st = {}
+                for enroll_key, recs in per_enroll.items():
+                    try:
+                        aggregated = aggregate_db_records_into_classes(recs)
+                        total_classes = len(aggregated)
+                        present_classes = sum(1 for v in aggregated.values() if v.get('present'))
+                        pct = round((present_classes / total_classes) * 100, 2) if total_classes else 0
+                    except Exception:
+                        pct = 0
+                        total_classes = 0
+                        present_classes = 0
+                    # try to get a name from first record
+                    name_val = recs[0][1] if recs and recs[0] and recs[0][1] else None
+                    lb.append({'enroll': str(enroll_key), 'name': name_val, 'percentage': pct})
+                    st[str(enroll_key)] = 0
+                # sort by percentage desc and return top_n
+                lb.sort(key=lambda x: x.get('percentage', 0), reverse=True)
+                return lb[:top_n], st
+        except Exception:
+            pass
     return leaderboard[:top_n], streaks
 
 
@@ -501,5 +945,1008 @@ def admin_change_password():
         return jsonify({'error': 'not-found'}), 404
     admins[target] = generate_password_hash(newpw)
     save_admins(admins)
-USERS[target] = admins[target]
+    # refresh in-memory store
+    USERS[target] = admins[target]
     return jsonify({'status': 'changed'})
+
+
+@app.route('/admin/delete_admin/<username>', methods=['POST'])
+def admin_delete_admin(username):
+    user = session.get('user')
+    if not user:
+        return jsonify({'error': 'not-authorized'}), 401
+    if not require_csrf():
+        return jsonify({'error': 'csrf-failed'}), 400
+    admins = load_admins()
+    # prevent deleting currently logged-in admin
+    if username == user:
+        return redirect(url_for('admin'))
+    # prevent deleting the last admin
+    if username in admins:
+        if len(admins) <= 1:
+            return redirect(url_for('admin'))
+        admins.pop(username)
+        save_admins(admins)
+        USERS.pop(username, None)
+    return redirect(url_for('admin'))
+
+
+@app.route('/student_reupload', methods=['GET', 'POST'])
+def student_reupload():
+    # student may reupload photos to update their known images; admin can also perform
+    if request.method == 'POST':
+        enroll = request.form.get('enroll')
+        files = request.files.getlist('photos')
+        if not enroll or not files:
+            return redirect(url_for('student_dashboard'))
+      
+        for d in os.listdir(KNOWN_DIR):
+            if d.endswith(f"_{secure_filename(enroll)}") or d.startswith(f"{secure_filename(enroll)}_"):
+                student_dir = os.path.join(KNOWN_DIR, d)
+                # clear folder
+                for f in os.listdir(student_dir):
+                    try:
+                        os.remove(os.path.join(student_dir, f))
+                    except Exception:
+                        pass
+                # save new
+                for i, f in enumerate(files):
+                    fname = f"{i+1}_{secure_filename(f.filename)}"
+                    f.save(os.path.join(student_dir, fname))
+                # regenerate encodings for this student
+                encodings = []
+                for imgfile in os.listdir(student_dir):
+                    imgpath = os.path.join(student_dir, imgfile)
+                    try:
+                        image = face_recognition.load_image_file(imgpath)
+                        faces = face_recognition.face_encodings(image)
+                        if faces:
+                            encodings.append(faces[0])
+                    except Exception:
+                        continue
+                # update DB
+                db = {}
+                import pickle
+                if os.path.exists(ENCODINGS_DB):
+                    try:
+                        with open(ENCODINGS_DB, 'rb') as f:
+                            db = pickle.load(f)
+                    except Exception:
+                        db = {}
+                db[f"{d}"] = [list(map(float, e)) for e in encodings]
+                os.makedirs(os.path.dirname(ENCODINGS_DB), exist_ok=True)
+                with open(ENCODINGS_DB, 'wb') as f:
+                    pickle.dump(db, f, protocol=pickle.HIGHEST_PROTOCOL)
+                # If recognizer running, reload DB
+                try:
+                    if RECOGNIZER is not None:
+                        RECOGNIZER.reload_db()
+                except Exception:
+                    pass
+                break
+    return redirect(url_for('student_dashboard'))
+
+
+@app.route('/forgot_password', methods=['GET', 'POST'])
+def forgot_password():
+    msg = None
+    if request.method == 'POST':
+        enroll = request.form.get('enroll')
+        students = load_students()
+        if enroll in students:
+            # create token
+            import secrets
+            token = secrets.token_urlsafe(16)
+            resets = load_password_resets()
+            resets[token] = {'enroll': enroll, 'created': __import__('time').time()}
+            save_password_resets(resets)
+            # In production you'd email; here we print token to console and show message
+            print(f"Password reset token for {enroll}: {token}")
+            msg = 'Reset token created and printed to server console.'
+        else:
+            msg = 'Enrollment not found.'
+    return render_template('forgot_password.html', msg=msg)
+
+
+@app.route('/reset_password/<token>', methods=['GET', 'POST'])
+def reset_password(token):
+    resets = load_password_resets()
+    info = resets.get(token)
+    if not info:
+        return 'Invalid or expired token', 400
+    if request.method == 'POST':
+        newpw = request.form.get('password')
+        students = load_students()
+        enroll = info['enroll']
+        if enroll in students:
+            students[enroll]['password'] = generate_password_hash(newpw)
+            save_students(students)
+            # remove token
+            resets.pop(token, None)
+            save_password_resets(resets)
+            return redirect(url_for('student_login'))
+    return render_template('reset_password.html', token=token)
+
+
+@app.route('/admin/reject/<enroll>', methods=['POST'])
+def admin_reject(enroll):
+    user = session.get('user')
+    if not user:
+        return jsonify({'error': 'not-authorized'}), 401
+    if not require_csrf():
+        return jsonify({'error': 'csrf-failed'}), 400
+    students = load_students()
+    if enroll in students:
+        students.pop(enroll)
+        save_students(students)
+    return redirect(url_for('admin'))
+
+
+COLLEGE_PHOTO_DIR = os.path.join(os.path.dirname(__file__), '..', 'data', 'college_photos')
+
+
+@app.route('/admin/upload_photos', methods=['POST'])
+def admin_upload_photos():
+    user = session.get('user')
+    if not user:
+        return jsonify({'error': 'not-authorized'}), 401
+    if not require_csrf():
+        return jsonify({'error': 'csrf-failed'}), 400
+    files = request.files.getlist('photos')
+    os.makedirs(COLLEGE_PHOTO_DIR, exist_ok=True)
+    for f in files:
+        fname = secure_filename(f.filename)
+        f.save(os.path.join(COLLEGE_PHOTO_DIR, fname))
+    return redirect(url_for('admin'))
+
+
+@app.route('/college_photos')
+def college_photos():
+    # return list of photo URLs (API)
+    os.makedirs(COLLEGE_PHOTO_DIR, exist_ok=True)
+    items = []
+    for fname in sorted(os.listdir(COLLEGE_PHOTO_DIR)):
+        items.append(url_for('college_photo_file', filename=fname))
+    return jsonify({'photos': items})
+
+
+@app.route('/college_photos/<path:filename>')
+def college_photo_file(filename):
+    # serve photo files from data/college_photos
+    return send_from_directory(COLLEGE_PHOTO_DIR, filename)
+
+@app.route('/admin')
+def admin():
+    user = session.get('user')
+    if not user:
+        return redirect(url_for('login'))
+    students = load_students()
+    leaderboard, streaks = compute_leaderboard_and_streaks()
+    os.makedirs(COLLEGE_PHOTO_DIR, exist_ok=True)
+    photos = [url_for('college_photo_file', filename=f) for f in sorted(os.listdir(COLLEGE_PHOTO_DIR))]
+    # load recognizer config if present
+    cfgpath = os.path.join(os.path.dirname(__file__), '..', 'data', 'config.json')
+    config = None
+    try:
+        import json
+        if os.path.exists(cfgpath):
+            with open(cfgpath, 'r', encoding='utf-8') as cf:
+                config = json.load(cf)
+    except Exception:
+        config = None
+    return render_template('admin.html', user=user, students=students, leaderboard=leaderboard, streaks=streaks, photos=photos, config=config)
+
+
+# Recognizer singleton (headless background recognizer for CCTV/RTSP)
+# Do not instantiate at import time. Only start when an authenticated admin requests it.
+RECOGNIZER = None
+
+# subprocess-based live GUI recognizer (scripts/live_recognize.py)
+import subprocess
+LIVE_PROC = None
+LIVE_SCRIPT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'scripts', 'live_recognize.py'))
+LIVE_LOG = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'data', 'live_recognize.log'))
+# Support multiple named live instances: {instance_id: {'proc': Popen, 'log': path, 'jpg': path}}
+LIVE_PROCS = {}
+
+def start_live_process(camera_src=0, tolerance=0.45, reconnect=False, instance_id=None):
+    global LIVE_PROC
+    # default single-instance behavior (backwards compatible)
+    if LIVE_PROC and LIVE_PROC.poll() is None:
+        return LIVE_PROC
+    # Normalize camera_src: empty strings are treated as default device 0,
+    # numeric strings are converted to int so OpenCV receives an int for device indexes.
+    try:
+        if isinstance(camera_src, str):
+            if camera_src.strip() == '':
+                camera_src = 0
+            elif camera_src.isdigit():
+                camera_src = int(camera_src)
+    except Exception:
+        # leave as-is on unexpected values; the child process will validate again
+        pass
+    # prefer the current Python interpreter so spawned process uses same env
+    python_cmd = sys.executable or 'python'
+    # on Windows prefer pythonw.exe (no-console) when available next to sys.executable
+    if os.name == 'nt':
+        try:
+            pyw = os.path.join(os.path.dirname(python_cmd), 'pythonw.exe')
+            if os.path.exists(pyw):
+                python_cmd = pyw
+        except Exception:
+            pass
+    cmd = [python_cmd, LIVE_SCRIPT, '--tolerance', str(tolerance), '--camera', str(camera_src), '--headless']
+    # if instance_id is provided, instruct child to write to a separate file
+    out_jpg = None
+    if instance_id:
+        out_jpg = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'data', f'live_stream_{instance_id}.jpg'))
+        cmd.extend(['--output', out_jpg])
+    if reconnect:
+        cmd.append('--reconnect')
+    # ensure log dir
+    os.makedirs(os.path.dirname(LIVE_LOG), exist_ok=True)
+    # open log file
+    try:
+        logf = open(LIVE_LOG, 'a', encoding='utf-8')
+    except Exception:
+        logf = open(os.devnull, 'wb')
+
+    # On Windows detach the child so it runs independently
+    creationflags = 0
+    startupinfo = None
+    if os.name == 'nt':
+        # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+        creationflags = 0x00000008 | 0x00000200 | 0x08000000
+        try:
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = subprocess.SW_HIDE
+        except Exception:
+            startupinfo = None
+
+    try:
+        proc = subprocess.Popen(cmd, stdout=logf, stderr=logf, close_fds=False, creationflags=creationflags, startupinfo=startupinfo)
+        # register in LIVE_PROCS if named
+        if instance_id:
+            LIVE_PROCS[instance_id] = {'proc': proc, 'log': logf.name, 'jpg': out_jpg}
+        else:
+            LIVE_PROC = proc
+        return proc
+    except Exception:
+        try:
+            logf.close()
+        except Exception:
+            pass
+        raise
+
+
+@app.route('/admin/live_status')
+def admin_live_status():
+    user = session.get('user')
+    if not user:
+        return jsonify({'error': 'not-authorized'}), 401
+
+    status = {'running': False, 'pid': None, 'last_frame': None, 'frame_size': None, 'log_tail': ''}
+    # process info
+    try:
+        if LIVE_PROC and LIVE_PROC.poll() is None:
+            status['running'] = True
+            status['pid'] = LIVE_PROC.pid
+    except Exception:
+        pass
+
+    # live_stream.jpg info
+    try:
+        jpgp = os.path.join(os.path.dirname(__file__), '..', 'data', 'live_stream.jpg')
+        if os.path.exists(jpgp):
+            st = os.stat(jpgp)
+            status['last_frame'] = int(st.st_mtime)
+            status['frame_size'] = int(st.st_size)
+    except Exception:
+        pass
+
+    # tail log
+    try:
+        if os.path.exists(LIVE_LOG):
+            with open(LIVE_LOG, 'rb') as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                toread = min(size, 2000)
+                f.seek(max(0, size - toread))
+                data = f.read().decode('utf-8', errors='replace')
+                status['log_tail'] = data
+    except Exception:
+        status['log_tail'] = ''
+
+    return jsonify(status)
+
+def stop_live_process():
+    global LIVE_PROC
+    if LIVE_PROC and LIVE_PROC.poll() is None:
+        try:
+            LIVE_PROC.terminate()
+            LIVE_PROC.wait(timeout=3)
+        except Exception:
+            try:
+                LIVE_PROC.kill()
+            except Exception:
+                pass
+    LIVE_PROC = None
+
+
+def gen_mjpeg(recognizer):
+    # generator for multipart/x-mixed-replace frames
+    while True:
+        # If recognizer isn't running, block briefly to avoid tight loop
+        if not recognizer.running():
+            time.sleep(0.2)
+            continue
+        # Wait for a new frame (with a short timeout) to reduce latency and CPU
+        frame = None
+        try:
+            frame = recognizer.get_frame_wait(timeout=1.0)
+        except Exception:
+            frame = recognizer.get_frame()
+        if not frame:
+            # if still no frame, loop back and wait again
+            continue
+        yield (b"--frame\r\n"
+               b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n")
+
+
+@app.route('/video_feed')
+def video_feed():
+    # public stream of latest frame; admin can start/stop recognizer
+    from flask import Response
+    # restrict to logged-in admin sessions
+    user = session.get('user')
+    if not user:
+        return jsonify({'error': 'not-authorized'}), 401
+    if RECOGNIZER is None:
+        return jsonify({'error': 'recognizer-unavailable'}), 500
+    return Response(gen_mjpeg(RECOGNIZER), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+
+@app.route('/live_stream.jpg')
+def live_stream_jpg():
+    jpgp = os.path.join(os.path.dirname(__file__), '..', 'data', 'live_stream.jpg')
+    # If the live image is missing, return a small placeholder JPEG (so UI shows a box)
+    if not os.path.exists(jpgp):
+        try:
+            # create a simple placeholder image (dark gray) using numpy + cv2
+            img = np.full((360, 640, 3), 28, dtype=np.uint8)
+            cv2.putText(img, 'No live feed', (24, 200), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (200,200,200), 2, cv2.LINE_AA)
+            is_success, buffer = cv2.imencode('.jpg', img)
+            if not is_success:
+                return '', 204
+            bio = io.BytesIO(buffer.tobytes())
+            resp = send_file(bio, mimetype='image/jpeg')
+            # prevent aggressive caching on client
+            resp.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+            return resp
+        except Exception:
+            return '', 204
+    try:
+        resp = send_file(jpgp, mimetype='image/jpeg')
+        resp.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+        return resp
+    except Exception:
+        return '', 500
+
+
+@app.route('/admin/start_live', methods=['POST'])
+def admin_start_live():
+    user = session.get('user')
+    if not user:
+        return jsonify({'error': 'not-authorized'}), 401
+    if not require_csrf():
+        return jsonify({'error': 'csrf-failed'}), 400
+    # Normalize incoming source: prefer explicit form fields, treat empty strings as default 0
+    src_raw = request.form.get('source') or request.form.get('camera')
+    if src_raw is None or (isinstance(src_raw, str) and src_raw.strip() == ''):
+        src = 0
+    else:
+        src = src_raw
+        try:
+            if isinstance(src, str) and src.isdigit():
+                src = int(src)
+        except Exception:
+            pass
+    tol = 0.45
+    try:
+        tr = request.form.get('tolerance')
+        if tr not in (None, ''):
+            tol = float(tr)
+    except Exception:
+        tol = 0.45
+    reconnect = bool(request.form.get('reconnect'))
+    try:
+        instance = request.form.get('instance') or None
+        p = start_live_process(camera_src=src, tolerance=tol, reconnect=reconnect, instance_id=instance)
+        return jsonify({'started': True, 'pid': p.pid, 'instance': instance})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/admin/stop_live', methods=['POST'])
+def admin_stop_live():
+    user = session.get('user')
+    if not user:
+        return jsonify({'error': 'not-authorized'}), 401
+    if not require_csrf():
+        return jsonify({'error': 'csrf-failed'}), 400
+    stop_live_process()
+    return jsonify({'stopped': True})
+
+
+@app.route('/admin/stop_live_instance', methods=['POST'])
+def admin_stop_live_instance():
+    user = session.get('user')
+    if not user:
+        return jsonify({'error': 'not-authorized'}), 401
+    if not require_csrf():
+        return jsonify({'error': 'csrf-failed'}), 400
+    instance = request.form.get('instance')
+    if not instance:
+        return jsonify({'error': 'missing-instance'}), 400
+    info = LIVE_PROCS.get(instance)
+    if info:
+        try:
+            proc = info.get('proc')
+            if proc and proc.poll() is None:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=3)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        # cleanup mapping
+        LIVE_PROCS.pop(instance, None)
+    return jsonify({'stopped': True})
+
+
+@app.route('/live_stream/<instance>.jpg')
+def live_stream_instance_jpg(instance):
+    # Look for per-instance live image first
+    jpgp = os.path.join(os.path.dirname(__file__), '..', 'data', f'live_stream_{instance}.jpg')
+    if os.path.exists(jpgp):
+        try:
+            resp = send_file(jpgp, mimetype='image/jpeg')
+            resp.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+            return resp
+        except Exception:
+            return '', 500
+    # fallback to default
+    return live_stream_jpg()
+
+
+@app.route('/admin/get_encodings')
+def admin_get_encodings():
+    dbp = os.path.join(os.path.dirname(__file__), '..', 'data', 'encodings_db.pkl')
+    if not os.path.exists(dbp):
+        return jsonify({'encodings': {}})
+    try:
+        import pickle
+        with open(dbp, 'rb') as f:
+            db = pickle.load(f)
+        summary = {k: len(v) for k, v in db.items()}
+        return jsonify({'encodings': summary})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/admin/live_log')
+def admin_live_log():
+    user = session.get('user')
+    if not user:
+        return jsonify({'error': 'not-authorized'}), 401
+    logp = LIVE_LOG
+    if not os.path.exists(logp):
+        return jsonify({'log': ''})
+    try:
+        # tail last 4000 characters
+        with open(logp, 'rb') as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            toread = min(size, 4000)
+            f.seek(size - toread)
+            data = f.read().decode('utf-8', errors='replace')
+        return jsonify({'log': data})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/admin/get_attendance_xlsx')
+def admin_get_attendance_xlsx():
+    user = session.get('user')
+    if not user:
+        return jsonify({'error': 'not-authorized'}), 401
+    xlsxp = os.path.join(os.path.dirname(__file__), '..', 'data', 'attendance.xlsx')
+    if not os.path.exists(xlsxp):
+        return jsonify({'error': 'not-found'}), 404
+    return send_file(xlsxp, as_attachment=True)
+
+
+@app.route('/admin/start_recognizer', methods=['POST'])
+def admin_start_recognizer():
+    user = session.get('user')
+    if not user:
+        return jsonify({'error': 'not-authorized'}), 401
+    if not require_csrf():
+        return jsonify({'error': 'csrf-failed'}), 400
+    # Normalize incoming source as above
+    src_raw = request.form.get('source') or request.form.get('camera')
+    if src_raw is None or (isinstance(src_raw, str) and src_raw.strip() == ''):
+        src = 0
+    else:
+        src = src_raw
+        try:
+            if isinstance(src, str) and src.isdigit():
+                src = int(src)
+        except Exception:
+            pass
+    # restart recognizer with new source
+    if Recognizer is None:
+        return jsonify({'error': 'recognizer-unavailable'}), 500
+    global RECOGNIZER
+    try:
+        if RECOGNIZER:
+            RECOGNIZER.stop()
+    except Exception:
+        pass
+    # create new instance with requested source/tolerance
+    # parse tolerance safely; accept empty string or invalid input and fallback to default
+    tol_raw = request.form.get('tolerance', '')
+    try:
+        tol = float(tol_raw) if tol_raw not in (None, '') else 0.45
+    except Exception:
+        try:
+            # fallback: attempt to parse tolerance safely from form, allow empty/missing
+            tol = float(request.form.get('tolerance', 0.45) or 0.45)
+        except Exception:
+            tol = 0.45
+    RECOGNIZER = Recognizer(source=src, tolerance=tol)
+    RECOGNIZER.start()
+    # persist config
+    try:
+        cfg = {'source': str(src), 'tolerance': float(tol)}
+        cfgpath = os.path.join(os.path.dirname(__file__), '..', 'data', 'config.json')
+        os.makedirs(os.path.dirname(cfgpath), exist_ok=True)
+        import json
+        with open(cfgpath, 'w', encoding='utf-8') as cf:
+            json.dump(cfg, cf, indent=2)
+    except Exception:
+        pass
+    return redirect(url_for('admin'))
+
+
+@app.route('/admin/test_camera', methods=['POST'])
+def admin_test_camera():
+    user = session.get('user')
+    if not user:
+        return jsonify({'error': 'not-authorized'}), 401
+    if not require_csrf():
+        return jsonify({'error': 'csrf-failed'}), 400
+ 
+    src = request.form.get('source')
+    if src is None or (isinstance(src, str) and src.strip() == ''):
+        src = 0
+    try:
+        if isinstance(src, str) and src.isdigit():
+            src = int(src)
+    except Exception:
+        pass
+    try:
+        cap = cv2.VideoCapture(src)
+        ok, frame = cap.read()
+        try:
+            cap.release()
+        except Exception:
+            pass
+        if ok and frame is not None:
+            return jsonify({'ok': True})
+        return jsonify({'ok': False}), 400
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
+
+@app.route('/admin/debug_camera', methods=['GET'])
+def admin_debug_camera():
+    """Diagnostic endpoint: attempts to open the requested camera source, read one frame,
+    and returns detailed information including recent live-recognize log tail and live_stream.jpg info.
+    Use ?source=0 (or omit) or ?source=rtsp://... to test.
+    """
+    user = session.get('user')
+    if not user:
+        return jsonify({'error': 'not-authorized'}), 401
+
+    src = request.args.get('source')
+    if src is None or (isinstance(src, str) and src.strip() == ''):
+        src = 0
+    try:
+        if isinstance(src, str) and src.isdigit():
+            src = int(src)
+    except Exception:
+        pass
+
+    result = {'source': str(src), 'is_opened': False, 'read_ok': False, 'frame_shape': None, 'cv2_info': None}
+    try:
+        # open camera
+        cap = cv2.VideoCapture(src)
+        result['is_opened'] = bool(cap.isOpened())
+        if cap.isOpened():
+            ret, frame = cap.read()
+            result['read_ok'] = bool(ret and frame is not None)
+            if result['read_ok']:
+                try:
+                    result['frame_shape'] = frame.shape
+                except Exception:
+                    result['frame_shape'] = None
+        try:
+            cap.release()
+        except Exception:
+            pass
+    except Exception as e:
+        result['error'] = str(e)
+
+    # include cv2 build info (shortened)
+    try:
+        result['cv2_version'] = getattr(cv2, '__version__', None)
+        bi = cv2.getBuildInformation()
+        # only include first ~800 chars to avoid huge payloads
+        result['cv2_build_info'] = bi[:800]
+    except Exception:
+        result['cv2_build_info'] = None
+
+    # attach last part of live recognizer log
+    try:
+        if os.path.exists(LIVE_LOG):
+            with open(LIVE_LOG, 'rb') as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                toread = min(size, 2000)
+                f.seek(max(0, size - toread))
+                data = f.read().decode('utf-8', errors='replace')
+            result['live_log_tail'] = data
+        else:
+            result['live_log_tail'] = ''
+    except Exception as e:
+        result['live_log_tail'] = f'log-error: {e}'
+
+    # include live_stream.jpg info
+    try:
+        jpgp = os.path.join(os.path.dirname(__file__), '..', 'data', 'live_stream.jpg')
+        if os.path.exists(jpgp):
+            st = os.stat(jpgp)
+            result['live_jpg_exists'] = True
+            result['live_jpg_size'] = int(st.st_size)
+            result['live_jpg_mtime'] = int(st.st_mtime)
+        else:
+            result['live_jpg_exists'] = False
+    except Exception as e:
+        result['live_jpg_info_error'] = str(e)
+
+    return jsonify(result)
+
+
+@app.route('/admin/camera_health')
+def admin_camera_health():
+    user = session.get('user')
+    if not user:
+        return jsonify({'error': 'not-authorized'}), 401
+    if RECOGNIZER is None:
+        return jsonify({'running': False, 'last_frame': None})
+    return jsonify({'running': RECOGNIZER.running(), 'last_frame': RECOGNIZER.get_last_frame_time(), 'last_names': RECOGNIZER.get_names()})
+
+
+@app.route('/admin/heartbeat', methods=['POST'])
+def admin_heartbeat():
+    """Called by the admin UI while the admin page is open. Updates the recognizer heartbeat
+    so the recognizer can auto-stop when the admin page is closed for a configurable timeout.
+    """
+    user = session.get('user')
+    if not user:
+        return jsonify({'error': 'not-authorized'}), 401
+    # minimal CSRF check (form or header)
+    if not require_csrf():
+        return jsonify({'error': 'csrf-failed'}), 400
+    try:
+        if RECOGNIZER is not None:
+            ok = RECOGNIZER.touch()
+            return jsonify({'ok': bool(ok), 'last_heartbeat': RECOGNIZER.get_last_heartbeat()})
+        return jsonify({'ok': False, 'error': 'no-recognizer'})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
+
+@app.route('/admin/export_attendance')
+def admin_export_attendance():
+    # Export SQLite attendance to Excel (Summary + Log) and send file
+    user = session.get('user')
+    if not user:
+        return jsonify({'error': 'not-authorized'}), 401
+    import sqlite3
+    try:
+        dbp = os.path.join(os.path.dirname(__file__), '..', 'data', 'attendance.db')
+        xlsxp = os.path.join(os.path.dirname(__file__), '..', 'data', 'attendance.xlsx')
+        conn = sqlite3.connect(dbp)
+        cur = conn.cursor()
+        rows = list(cur.execute('SELECT when_ts, name, image_path FROM attendance ORDER BY id'))
+        conn.close()
+        # write excel
+        try:
+            from openpyxl import Workbook
+            wb = Workbook()
+            log = wb.active
+            log.title = 'Log'
+            log.append(['Timestamp', 'Name', 'ImagePath'])
+            for r in rows:
+                log.append([r[0], r[1], r[2]])
+            if 'Summary' not in wb.sheetnames:
+                wb.create_sheet('Summary')
+            wb.save(xlsxp)
+        except Exception:
+            pass
+        return send_file(xlsxp, as_attachment=True)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/admin/stop_recognizer', methods=['POST'])
+def admin_stop_recognizer():
+    user = session.get('user')
+    if not user:
+        return jsonify({'error': 'not-authorized'}), 401
+    if not require_csrf():
+        return jsonify({'error': 'csrf-failed'}), 400
+    if RECOGNIZER is None:
+        return jsonify({'status': 'not-running'})
+    try:
+        RECOGNIZER.stop()
+    except Exception:
+        pass
+    return redirect(url_for('admin'))
+
+
+@app.route('/admin/recognizer_status')
+def admin_recognizer_status():
+    user = session.get('user')
+    if not user:
+        return jsonify({'running': False})
+    if RECOGNIZER is None:
+        # attempt to infer last detected names from the live recognizer log as a fallback
+        last_names = []
+        try:
+            logp = os.path.join(os.path.dirname(__file__), '..', 'data', 'live_recognize.log')
+            if os.path.exists(logp):
+                with open(logp, 'rb') as f:
+                    f.seek(0, os.SEEK_END)
+                    size = f.tell()
+                    toread = min(size, 2000)
+                    f.seek(max(0, size - toread))
+                    data = f.read().decode('utf-8', errors='replace')
+                # heuristic: look for lines that include 'Saved attendance for' or 'Detected'
+                lines = [l.strip() for l in data.splitlines() if l.strip()]
+                for l in reversed(lines[-150:]):
+                    if 'Saved attendance' in l or 'Saved frame' in l or 'Auto-saved' in l or 'Saved frame' in l:
+                        # try to extract names after ':' or for 'for <names>' patterns
+                        import re
+                        m = re.search(r'for[: ]+(.*)', l, re.IGNORECASE)
+                        if m:
+                            names_part = m.group(1)
+                            # split by comma and trim
+                            for nm in names_part.split(','):
+                                n = nm.strip()
+                                if n and n.lower() != 'unknown':
+                                    last_names.append(n)
+                            if last_names:
+                                break
+                # dedupe preserving order
+                seen = set(); last_names = [x for x in last_names if not (x in seen or seen.add(x))]
+        except Exception:
+            last_names = []
+        # If log parsing didn't find names, fall back to recent attendance DB rows
+        if not last_names:
+            try:
+                dbp = os.path.join(os.path.dirname(__file__), '..', 'data', 'attendance.db')
+                if os.path.exists(dbp):
+                    import sqlite3
+                    conn = sqlite3.connect(dbp)
+                    cur = conn.cursor()
+                    cur.execute("SELECT name FROM attendance WHERE name IS NOT NULL ORDER BY id DESC LIMIT 20")
+                    rows = cur.fetchall()
+                    conn.close()
+                    seen = set()
+                    names = []
+                    for r in rows:
+                        try:
+                            n = (r[0] or '').strip()
+                            if n and n.lower() != 'unknown' and n not in seen:
+                                names.append(n)
+                                seen.add(n)
+                        except Exception:
+                            continue
+                    last_names = names
+            except Exception:
+                pass
+        return jsonify({'running': False, 'last_names': last_names})
+    return jsonify({'running': RECOGNIZER.running(), 'last_names': RECOGNIZER.get_names()})
+
+
+@app.route('/admin/latest_attendance')
+def admin_latest_attendance():
+    """Return recent attendance groups (timestamp -> names, image path) from sqlite attendance DB.
+    This helps the admin UI show which faces were captured most recently.
+    """
+    user = session.get('user')
+    if not user:
+        return jsonify({'error': 'not-authorized'}), 401
+    dbp = os.path.join(os.path.dirname(__file__), '..', 'data', 'attendance.db')
+    if not os.path.exists(dbp):
+        return jsonify({'latest': []})
+    try:
+        conn = sqlite3.connect(dbp)
+        cur = conn.cursor()
+        # group names by timestamp and pick the most recent 10 timestamps
+        cur.execute("""
+            SELECT when_ts, GROUP_CONCAT(name, ',') as names, GROUP_CONCAT(enroll, ',') as enrolls, image_path
+            FROM attendance
+            GROUP BY when_ts, image_path
+            ORDER BY MAX(id) DESC
+            LIMIT 10
+        """)
+        rows = cur.fetchall()
+        conn.close()
+        # build name->enroll map from students.json to use as a fallback when DB rows lack enroll
+        try:
+            students_map = load_students()
+            name_to_enroll = { (v.get('name') or '').strip().lower(): str(v.get('enroll') or k) for k, v in students_map.items() }
+        except Exception:
+            name_to_enroll = {}
+
+        out = []
+        for when_ts, names, enrolls, image_path in rows:
+            # Convert filesystem image path to a web URL if possible. The attendance images are stored under data/attendance.
+            image_url = None
+            try:
+                if image_path and isinstance(image_path, str):
+                    # If the path already looks like a URL, use it directly
+                    if image_path.startswith('http://') or image_path.startswith('https://'):
+                        image_url = image_path
+                    else:
+                        # map to /attendance_images/<filename>
+                        img_fname = os.path.basename(image_path)
+                        image_url = url_for('attendance_image_file', filename=img_fname)
+            except Exception:
+                image_url = None
+            # names and enrolls are expected as comma-separated GROUP_CONCAT results
+            names_list = names.split(',') if names else []
+            enrolls_list = enrolls.split(',') if enrolls else []
+
+            # If counts match, zip directly; otherwise re-query per-row to preserve ordering
+            if names_list and len(names_list) == len(enrolls_list):
+                pairs = []
+                for n, e in zip(names_list, enrolls_list):
+                    # normalize empty enroll tokens
+                    en = None
+                    try:
+                        en = None if (e is None or str(e).strip() == '') else str(e)
+                    except Exception:
+                        en = None
+                    pairs.append({'name': n, 'enroll': en})
+            else:
+                try:
+                    conn2 = sqlite3.connect(dbp)
+                    cur2 = conn2.cursor()
+                    cur2.execute('SELECT name, enroll FROM attendance WHERE when_ts=? ORDER BY id', (when_ts,))
+                    rows2 = cur2.fetchall()
+                    conn2.close()
+                    pairs = []
+                    for r in rows2:
+                        nm = r[0]
+                        en = r[1]
+                        try:
+                            en = None if (en is None or str(en).strip() == '') else str(en)
+                        except Exception:
+                            en = None
+                        pairs.append({'name': nm, 'enroll': en})
+                except Exception:
+                    # last-resort: return names without enrolls
+                    pairs = [{'name': n, 'enroll': None} for n in names_list]
+            # Fill missing enrolls from students.json mapping when possible
+            for p in pairs:
+                if not p.get('enroll'):
+                    try:
+                        lookup = (p.get('name') or '').strip().lower()
+                        if lookup and lookup in name_to_enroll:
+                            p['enroll'] = name_to_enroll[lookup]
+                    except Exception:
+                        pass
+
+            out.append({'timestamp': when_ts, 'entries': pairs, 'image': image_url})
+        return jsonify({'latest': out})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/student_history/<enroll>')
+def api_student_history(enroll):
+        """API: return per-session attendance for a student and recent images/stats."""
+        try:
+            data = extract_attendance_timeseries(enroll)
+            # attach last_seen timestamp (from attendance.db)
+            try:
+                dbp = os.path.join(os.path.dirname(__file__), '..', 'data', 'attendance.db')
+                if os.path.exists(dbp):
+                    import sqlite3
+                    conn = sqlite3.connect(dbp)
+                    cur = conn.cursor()
+                    cur.execute('SELECT when_ts FROM attendance WHERE enroll=? ORDER BY id DESC LIMIT 1', (enroll,))
+                    row = cur.fetchone()
+                    conn.close()
+                    if row:
+                        data['last_seen'] = row[0]
+            except Exception:
+                data['last_seen'] = None
+            return jsonify({'ok': True, 'data': data})
+        except Exception as e:
+            return jsonify({'ok': False, 'error': str(e)}), 500
+
+
+@app.route('/attendance_images/<path:filename>')
+def attendance_image_file(filename):
+    """Serve attendance images from data/attendance directory."""
+    img_dir = os.path.join(os.path.dirname(__file__), '..', 'data', 'attendance')
+    try:
+        return send_from_directory(img_dir, filename)
+    except Exception:
+        return '', 404
+
+
+@app.route('/api/leaderboard')
+def api_leaderboard():
+    lb, streaks = compute_leaderboard_and_streaks(100)
+    return jsonify({'leaderboard': lb, 'streaks': streaks})
+
+
+@app.route('/api/pending_students')
+def api_pending_students():
+    students = load_students()
+    pending = [s for s in students.values() if not s.get('approved')]
+    return jsonify({'pending': pending})
+
+@app.route('/attendance')
+def attendance():
+    # Read Excel and return as JSON for frontend table. Sanitize headers so keys are strings
+    wb = openpyxl.load_workbook(EXCEL_PATH, data_only=True)
+    sheet = wb['Summary']
+    data = []
+    raw_headers = [cell.value for cell in next(sheet.iter_rows(min_row=1, max_row=1))]
+    # Ensure headers are strings (JSON requires string keys and Flask may sort keys)
+    headers = []
+    for i, h in enumerate(raw_headers):
+        if h is None:
+            headers.append(f"col_{i}")
+        else:
+            headers.append(str(h))
+    for row in sheet.iter_rows(min_row=2, values_only=True):
+        # map using sanitized headers; convert None cell values to empty string to keep JSON clean
+        row_map = {}
+        for i, h in enumerate(headers):
+            v = row[i] if i < len(row) else None
+            row_map[h] = '' if v is None else v
+        data.append(row_map)
+    return jsonify({'headers': headers, 'rows': data})
+
+@app.route('/download')
+def download():
+    return send_file(EXCEL_PATH, as_attachment=True)
+
+if __name__ == '__main__':
+
+    app.run(host='0.0.0.0', port=8000, debug=False, use_reloader=False, threaded=True)
+
